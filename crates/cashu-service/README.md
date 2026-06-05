@@ -9,5 +9,6 @@ logic in each binary.
 ## Features
 
 - optional wallet support behind the `wallet` feature
+- experimental Cashu Spilman channel support behind the `spilman` feature
 - shared async helpers for invoking external payment workflows
 - serde-friendly request and response types for service integration

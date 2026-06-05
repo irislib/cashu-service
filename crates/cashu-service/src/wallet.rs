@@ -803,16 +803,15 @@ mod tests {
     use async_trait::async_trait;
     use cdk::cdk_database::WalletDatabase;
     use cdk::nuts::{
-        CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, KeySet, KeySetInfo, Keys,
-        KeysetResponse, MeltQuoteBolt11Request, MeltQuoteBolt11Response, MeltQuoteBolt12Request,
-        MeltQuoteBolt12Response, MeltRequest, MintInfo, MintQuoteBolt11Request,
-        MintQuoteBolt11Response, MintQuoteBolt12Request, MintQuoteBolt12Response,
-        MintQuoteCustomRequest, MintQuoteCustomResponse, MintRequest, MintResponse, PaymentMethod,
+        BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse,
+        CurrencyUnit, Id, KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response,
+        MeltRequest, MintInfo, MintQuoteBolt11Response, MintRequest, MintResponse, PaymentMethod,
         Proof, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
     };
     use cdk::secret::Secret;
     use cdk::wallet::{types::ProofInfo, MintConnector, WalletBuilder};
-    use cdk::{nuts::MeltQuoteCustomResponse, Amount, Error};
+    use cdk::{Amount, Error};
+    use cdk_common::{MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest, MintQuoteResponse};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -882,15 +881,16 @@ mod tests {
 
         async fn post_mint_quote(
             &self,
-            _request: MintQuoteBolt11Request,
-        ) -> Result<MintQuoteBolt11Response<String>, Error> {
+            _request: MintQuoteRequest,
+        ) -> Result<MintQuoteResponse<String>, Error> {
             unreachable!("unused in Cashu Lightning payment test")
         }
 
         async fn get_mint_quote_status(
             &self,
+            _method: PaymentMethod,
             _quote_id: &str,
-        ) -> Result<MintQuoteBolt11Response<String>, Error> {
+        ) -> Result<MintQuoteResponse<String>, Error> {
             unreachable!("unused in Cashu Lightning payment test")
         }
 
@@ -904,13 +904,16 @@ mod tests {
 
         async fn post_melt_quote(
             &self,
-            request: MeltQuoteBolt11Request,
-        ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+            request: MeltQuoteRequest,
+        ) -> Result<MeltQuoteResponse<String>, Error> {
+            let MeltQuoteRequest::Bolt11(request) = request else {
+                unreachable!("unused payment method in Cashu Lightning payment test")
+            };
             let amount_msat = request
                 .request
                 .amount_milli_satoshis()
                 .ok_or(Error::InvoiceAmountUndefined)?;
-            Ok(MeltQuoteBolt11Response {
+            Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
                 quote: self.quote_id.clone(),
                 amount: Amount::from(amount_msat / 1000),
                 fee_reserve: Amount::ZERO,
@@ -920,13 +923,14 @@ mod tests {
                 change: None,
                 request: Some(request.request.to_string()),
                 unit: Some(CurrencyUnit::Sat),
-            })
+            }))
         }
 
         async fn get_melt_quote_status(
             &self,
+            _method: PaymentMethod,
             _quote_id: &str,
-        ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+        ) -> Result<MeltQuoteResponse<String>, Error> {
             unreachable!("unused in Cashu Lightning payment test")
         }
 
@@ -976,62 +980,19 @@ mod tests {
 
         async fn set_auth_wallet(&self, _wallet: Option<cdk::wallet::AuthWallet>) {}
 
-        async fn post_mint_bolt12_quote(
-            &self,
-            _request: MintQuoteBolt12Request,
-        ) -> Result<MintQuoteBolt12Response<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
-        }
-
-        async fn get_mint_quote_bolt12_status(
-            &self,
-            _quote_id: &str,
-        ) -> Result<MintQuoteBolt12Response<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
-        }
-
-        async fn post_melt_bolt12_quote(
-            &self,
-            _request: MeltQuoteBolt12Request,
-        ) -> Result<MeltQuoteBolt12Response<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
-        }
-
-        async fn get_melt_bolt12_quote_status(
-            &self,
-            _quote_id: &str,
-        ) -> Result<MeltQuoteBolt12Response<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
-        }
-
-        async fn post_mint_custom_quote(
+        async fn post_batch_check_mint_quote_status(
             &self,
             _method: &PaymentMethod,
-            _request: MintQuoteCustomRequest,
-        ) -> Result<MintQuoteCustomResponse<String>, Error> {
+            _request: BatchCheckMintQuoteRequest<String>,
+        ) -> Result<Vec<MintQuoteBolt11Response<String>>, Error> {
             unreachable!("unused in Cashu Lightning payment test")
         }
 
-        async fn get_mint_quote_custom_status(
+        async fn post_batch_mint(
             &self,
-            _method: &str,
-            _quote_id: &str,
-        ) -> Result<MintQuoteCustomResponse<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
-        }
-
-        async fn post_melt_custom_quote(
-            &self,
-            _request: cdk::nuts::MeltQuoteCustomRequest,
-        ) -> Result<MeltQuoteCustomResponse<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
-        }
-
-        async fn get_melt_quote_custom_status(
-            &self,
-            _method: &str,
-            _quote_id: &str,
-        ) -> Result<MeltQuoteCustomResponse<String>, Error> {
+            _method: &PaymentMethod,
+            _request: BatchMintRequest<String>,
+        ) -> Result<MintResponse, Error> {
             unreachable!("unused in Cashu Lightning payment test")
         }
     }
@@ -1059,14 +1020,12 @@ mod tests {
     }
 
     fn make_proof_info(keyset_id: Id, amount: u64, mint_url: MintUrl) -> ProofInfo {
-        let proof = Proof {
-            amount: Amount::from(amount),
+        let proof = Proof::new(
+            Amount::from(amount),
             keyset_id,
-            secret: Secret::generate(),
-            c: SecretKey::generate().public_key(),
-            witness: None,
-            dleq: None,
-        };
+            Secret::generate(),
+            SecretKey::generate().public_key(),
+        );
         ProofInfo::new(proof, mint_url, State::Unspent, CurrencyUnit::Sat).unwrap()
     }
 
