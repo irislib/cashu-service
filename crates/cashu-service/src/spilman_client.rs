@@ -403,10 +403,11 @@ where
     let mut host = cdk_spilman::ConfigurableClientHost::new(storage);
     let sender_pubkey_hex = host.add_key_from_hex(&sender.secret_hex)?;
     let bridge = cdk_spilman::SpilmanClientBridge::new(host, NoopSpilmanClientNetworking);
+    let receiver_pubkey_hex = normalize_spilman_receiver_pubkey_hex(&request.receiver_pubkey_hex);
     let opened = bridge
         .open_channel_from_token_async(
             &request.token,
-            &request.receiver_pubkey_hex,
+            &receiver_pubkey_hex,
             &sender_pubkey_hex,
             request.expiry_unix,
             &request.keyset_info_json,
@@ -425,7 +426,7 @@ where
         channel_id: opened.channel_id,
         mint_url: opened.mint_url,
         sender_pubkey_hex: opened.sender_pubkey_hex,
-        receiver_pubkey_hex: request.receiver_pubkey_hex,
+        receiver_pubkey_hex,
         unit: unit.as_str().to_string(),
         capacity: opened.capacity,
         capacity_sat: unit.capacity_to_sat(opened.capacity),
@@ -434,6 +435,17 @@ where
         opening_paid_msat: unit.balance_to_msat(payment.balance),
         payment,
     })
+}
+
+#[cfg(feature = "spilman-wallet")]
+fn normalize_spilman_receiver_pubkey_hex(value: &str) -> String {
+    let trimmed = value.trim();
+    let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        format!("02{hex}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(feature = "spilman-wallet-http")]
@@ -736,6 +748,21 @@ mod tests {
         assert_eq!(first.version, SPILMAN_SENDER_KEY_VERSION);
         assert_eq!(first.secret_hex.len(), 64);
         assert!(!first.public_key_hex.is_empty());
+    }
+
+    #[cfg(feature = "spilman-wallet")]
+    #[test]
+    fn receiver_pubkey_normalization_accepts_x_only_keys() {
+        let x_only = "ab".repeat(32);
+
+        assert_eq!(
+            normalize_spilman_receiver_pubkey_hex(&x_only),
+            format!("02{x_only}")
+        );
+        assert_eq!(
+            normalize_spilman_receiver_pubkey_hex(&format!("03{x_only}")),
+            format!("03{x_only}")
+        );
     }
 
     #[cfg(feature = "spilman-wallet")]
