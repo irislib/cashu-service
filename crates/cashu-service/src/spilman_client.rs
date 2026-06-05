@@ -11,7 +11,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "spilman-wallet")]
-use crate::spilman::{CashuSpilmanPayment, StreamingRouteCashuUnit};
+use crate::spilman::{
+    create_streaming_route_cashu_payment, CashuSpilmanPayment, CashuSpilmanPaymentSigner,
+    StreamingRouteCashuPaymentRequest, StreamingRouteCashuPaymentResult, StreamingRouteCashuUnit,
+};
 
 const SPILMAN_CLIENT_STORE_VERSION: u16 = 1;
 #[cfg(feature = "spilman-wallet")]
@@ -226,6 +229,79 @@ pub fn load_or_create_cashu_spilman_sender_key(
         }
         Err(error) => Err(format!("failed to read Spilman sender key: {error}")),
     }
+}
+
+#[cfg(feature = "spilman-wallet")]
+#[derive(Debug)]
+pub struct FileSpilmanPaymentSigner {
+    bridge: cdk_spilman::SpilmanClientBridge<
+        cdk_spilman::ConfigurableClientHost<FileSpilmanClientStorage>,
+        NoopSpilmanClientNetworking,
+    >,
+    storage_errors: FileSpilmanClientStorageErrorHandle,
+}
+
+#[cfg(feature = "spilman-wallet")]
+impl FileSpilmanPaymentSigner {
+    pub fn load(data_dir: &Path) -> Result<Self, String> {
+        let store_path = spilman_client_store_path(data_dir);
+        let (storage, storage_errors) = FileSpilmanClientStorage::load(store_path)?;
+        let sender = load_or_create_cashu_spilman_sender_key(data_dir)?;
+        let mut host = cdk_spilman::ConfigurableClientHost::new(storage);
+        let public_key_hex = host.add_key_from_hex(&sender.secret_hex)?;
+        if public_key_hex != sender.public_key_hex {
+            return Err("Spilman sender key public key does not match secret".to_string());
+        }
+        Ok(Self {
+            bridge: cdk_spilman::SpilmanClientBridge::new(host, NoopSpilmanClientNetworking),
+            storage_errors,
+        })
+    }
+
+    pub fn create_streaming_route_payment(
+        &self,
+        request: StreamingRouteCashuPaymentRequest,
+    ) -> Result<StreamingRouteCashuPaymentResult, String> {
+        let result = create_streaming_route_cashu_payment(self, request)?;
+        self.storage_errors.ensure_ok()?;
+        Ok(result)
+    }
+}
+
+#[cfg(feature = "spilman-wallet")]
+impl CashuSpilmanPaymentSigner for FileSpilmanPaymentSigner {
+    fn sign_cashu_spilman_payment(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        include_funding: bool,
+    ) -> Result<CashuSpilmanPayment, String> {
+        let payment =
+            self.bridge
+                .sign_cashu_spilman_payment(channel_id, balance, include_funding)?;
+        self.storage_errors.ensure_ok()?;
+        Ok(payment)
+    }
+
+    fn sign_cashu_spilman_close(
+        &self,
+        channel_id: &str,
+        final_balance: u64,
+    ) -> Result<CashuSpilmanPayment, String> {
+        let payment = self
+            .bridge
+            .sign_cashu_spilman_close(channel_id, final_balance)?;
+        self.storage_errors.ensure_ok()?;
+        Ok(payment)
+    }
+}
+
+#[cfg(feature = "spilman-wallet")]
+pub fn create_streaming_route_cashu_payment_from_client_store(
+    data_dir: &Path,
+    request: StreamingRouteCashuPaymentRequest,
+) -> Result<StreamingRouteCashuPaymentResult, String> {
+    FileSpilmanPaymentSigner::load(data_dir)?.create_streaming_route_payment(request)
 }
 
 #[cfg(feature = "spilman-wallet")]
@@ -660,6 +736,19 @@ mod tests {
         assert_eq!(first.version, SPILMAN_SENDER_KEY_VERSION);
         assert_eq!(first.secret_hex.len(), 64);
         assert!(!first.public_key_hex.is_empty());
+    }
+
+    #[cfg(feature = "spilman-wallet")]
+    #[test]
+    fn file_spilman_payment_signer_reports_missing_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let signer = FileSpilmanPaymentSigner::load(temp.path()).unwrap();
+        let error = signer
+            .sign_cashu_spilman_payment("missing-channel", 1, false)
+            .expect_err("signing a missing channel should fail");
+
+        assert!(error.contains("Channel not found: missing-channel"));
+        assert!(spilman_sender_key_path(temp.path()).exists());
     }
 
     #[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
