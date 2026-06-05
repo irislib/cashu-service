@@ -12,7 +12,8 @@ description = "Reusable Cashu helper and wallet primitives for paid connectivity
 default = []
 wallet = ["dep:cdk", "dep:cdk-sqlite", "dep:rand", "dep:url", "dep:hex", "dep:uuid"]
 spilman = ["dep:cdk-spilman"]
-spilman-wallet = ["spilman", "cdk-spilman/wallet"]
+spilman-wallet = ["spilman", "cdk-spilman/wallet", "dep:rand", "dep:hex"]
+spilman-wallet-http = ["spilman-wallet", "dep:reqwest"]
 spilman-configurable-host = ["spilman", "cdk-spilman/configurable-host"]
 spilman-configurable-host-reqwest = [
   "spilman-configurable-host",
@@ -32,6 +33,7 @@ cdk = { workspace = true, features = ["wallet"], optional = true }
 cdk-sqlite = { workspace = true, features = ["wallet"], optional = true }
 hex = { workspace = true, optional = true }
 rand = { version = "0.8", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 url = { version = "2", optional = true }
 uuid = { workspace = true, optional = true }
 

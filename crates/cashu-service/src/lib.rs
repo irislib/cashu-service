@@ -13,3 +13,8 @@ pub use wallet::*;
 pub mod spilman;
 #[cfg(feature = "spilman")]
 pub use spilman::*;
+
+#[cfg(feature = "spilman")]
+pub mod spilman_client;
+#[cfg(feature = "spilman")]
+pub use spilman_client::*;
