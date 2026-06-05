@@ -99,6 +99,201 @@ impl CashuSpilmanPayment {
     }
 }
 
+/// Cashu denomination used by the Spilman channel balance.
+///
+/// Route accounting is denominated in millisats, while the underlying Cashu
+/// channel may be funded in whole sats. Whole-sat channels round required
+/// balances up so a signed update never underpays a metered route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingRouteCashuUnit {
+    Sat,
+    Msat,
+}
+
+impl StreamingRouteCashuUnit {
+    pub fn parse(unit: &str) -> Result<Self, String> {
+        match unit.trim().to_ascii_lowercase().as_str() {
+            "" | "sat" | "sats" => Ok(Self::Sat),
+            "msat" | "msats" => Ok(Self::Msat),
+            other => Err(format!("unsupported Cashu channel unit '{other}'")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sat => "sat",
+            Self::Msat => "msat",
+        }
+    }
+
+    pub fn balance_to_msat(self, balance: u64) -> u64 {
+        match self {
+            Self::Sat => balance.saturating_mul(1_000),
+            Self::Msat => balance,
+        }
+    }
+
+    pub fn balance_from_msat(self, paid_msat: u64) -> u64 {
+        match self {
+            Self::Sat => paid_msat.div_ceil(1_000),
+            Self::Msat => paid_msat,
+        }
+    }
+
+    pub fn capacity_from_sat(self, capacity_sat: u64) -> u64 {
+        match self {
+            Self::Sat => capacity_sat,
+            Self::Msat => capacity_sat.saturating_mul(1_000),
+        }
+    }
+
+    pub fn capacity_to_sat(self, capacity: u64) -> u64 {
+        match self {
+            Self::Sat => capacity,
+            Self::Msat => capacity.div_ceil(1_000),
+        }
+    }
+}
+
+pub fn streaming_route_cashu_balance_msat(unit: &str, balance: u64) -> Result<u64, String> {
+    Ok(StreamingRouteCashuUnit::parse(unit)?.balance_to_msat(balance))
+}
+
+pub fn streaming_route_cashu_balance_for_msat(unit: &str, paid_msat: u64) -> Result<u64, String> {
+    Ok(StreamingRouteCashuUnit::parse(unit)?.balance_from_msat(paid_msat))
+}
+
+pub fn streaming_route_cashu_capacity_for_sat(
+    unit: &str,
+    capacity_sat: u64,
+) -> Result<u64, String> {
+    Ok(StreamingRouteCashuUnit::parse(unit)?.capacity_from_sat(capacity_sat))
+}
+
+pub fn streaming_route_cashu_capacity_sat(unit: &str, capacity: u64) -> Result<u64, String> {
+    Ok(StreamingRouteCashuUnit::parse(unit)?.capacity_to_sat(capacity))
+}
+
+pub fn streaming_route_cashu_capacity_msat(unit: &str, capacity: u64) -> Result<u64, String> {
+    Ok(StreamingRouteCashuUnit::parse(unit)?.balance_to_msat(capacity))
+}
+
+/// Kind of signed Spilman payment a buyer needs for route streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingRouteCashuPaymentKind {
+    ChannelOpen,
+    BalanceUpdate,
+    CooperativeClose,
+}
+
+impl StreamingRouteCashuPaymentKind {
+    pub fn include_funding(self) -> bool {
+        matches!(self, Self::ChannelOpen)
+    }
+}
+
+/// Request for creating a signed Cashu-Spilman payment for a paid route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuPaymentRequest {
+    pub kind: StreamingRouteCashuPaymentKind,
+    pub channel_id: String,
+    #[serde(default = "default_streaming_route_cashu_unit")]
+    pub unit: String,
+    pub paid_msat: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub previous_paid_msat: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub capacity_sat: u64,
+}
+
+/// Signed payment plus the route-accounting values that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuPaymentResult {
+    pub payment: CashuSpilmanPayment,
+    pub unit: String,
+    pub balance: u64,
+    pub paid_msat: u64,
+    pub include_funding: bool,
+}
+
+/// Small signer facade implemented by the local upstream Spilman client bridge.
+///
+/// Tests and app code can depend on this trait without coupling storage,
+/// networking, or key management to `cashu-service`.
+pub trait CashuSpilmanPaymentSigner {
+    fn sign_cashu_spilman_payment(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        include_funding: bool,
+    ) -> Result<CashuSpilmanPayment, String>;
+
+    fn sign_cashu_spilman_close(
+        &self,
+        channel_id: &str,
+        final_balance: u64,
+    ) -> Result<CashuSpilmanPayment, String> {
+        self.sign_cashu_spilman_payment(channel_id, final_balance, false)
+    }
+}
+
+pub fn create_streaming_route_cashu_payment<S: CashuSpilmanPaymentSigner>(
+    signer: &S,
+    request: StreamingRouteCashuPaymentRequest,
+) -> Result<StreamingRouteCashuPaymentResult, String> {
+    let channel_id = request.channel_id.trim();
+    if channel_id.is_empty() {
+        return Err("missing Cashu Spilman channel id".to_string());
+    }
+    let unit = StreamingRouteCashuUnit::parse(&request.unit)?;
+    if request.paid_msat < request.previous_paid_msat {
+        return Err(format!(
+            "paid route payment amount regressed: {} msat < {} msat",
+            request.paid_msat, request.previous_paid_msat
+        ));
+    }
+    let capacity_msat = request.capacity_sat.saturating_mul(1_000);
+    if capacity_msat > 0 && request.paid_msat > capacity_msat {
+        return Err(format!(
+            "paid route payment {} msat exceeds channel capacity {} msat",
+            request.paid_msat, capacity_msat
+        ));
+    }
+
+    let balance = unit.balance_from_msat(request.paid_msat);
+    let include_funding = request.kind.include_funding();
+    let payment = if request.kind == StreamingRouteCashuPaymentKind::CooperativeClose {
+        signer.sign_cashu_spilman_close(channel_id, balance)?
+    } else {
+        signer.sign_cashu_spilman_payment(channel_id, balance, include_funding)?
+    };
+    if payment.channel_id.trim() != channel_id {
+        return Err(format!(
+            "signed Cashu Spilman payment channel {} does not match requested channel {}",
+            payment.channel_id, channel_id
+        ));
+    }
+    if payment.balance != balance {
+        return Err(format!(
+            "signed Cashu Spilman payment balance {} does not match requested balance {}",
+            payment.balance, balance
+        ));
+    }
+    if include_funding && !payment.has_funding() {
+        return Err("opening Cashu Spilman payment is missing funding data".to_string());
+    }
+
+    Ok(StreamingRouteCashuPaymentResult {
+        payment,
+        unit: unit.as_str().to_string(),
+        balance,
+        paid_msat: unit.balance_to_msat(balance),
+        include_funding,
+    })
+}
+
 /// Transport-neutral payment message for a metered route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamingRoutePaymentEnvelope {
@@ -261,6 +456,14 @@ fn default_streaming_route_payment_protocol_version() -> u16 {
     STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION
 }
 
+fn default_streaming_route_cashu_unit() -> String {
+    StreamingRouteCashuUnit::Sat.as_str().to_string()
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[cfg(feature = "spilman")]
 impl From<upstream::Payment> for CashuSpilmanPayment {
     fn from(payment: upstream::Payment) -> Self {
@@ -295,6 +498,36 @@ impl TryFrom<CashuSpilmanPayment> for upstream::Payment {
     }
 }
 
+#[cfg(feature = "spilman")]
+impl<H, N> CashuSpilmanPaymentSigner for upstream::SpilmanClientBridge<H, N>
+where
+    H: upstream::SpilmanClientHost,
+    N: upstream::SpilmanClientNetworking,
+{
+    fn sign_cashu_spilman_payment(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        include_funding: bool,
+    ) -> Result<CashuSpilmanPayment, String> {
+        let payment = if include_funding {
+            self.create_payment_with_funding(channel_id, balance)?
+        } else {
+            self.create_payment(channel_id, balance)?
+        };
+        Ok(payment.into())
+    }
+
+    fn sign_cashu_spilman_close(
+        &self,
+        channel_id: &str,
+        final_balance: u64,
+    ) -> Result<CashuSpilmanPayment, String> {
+        self.create_cooperative_close_request(channel_id, final_balance)
+            .map(Into::into)
+    }
+}
+
 /// Re-exports of the pinned implementation crate for callers that need the
 /// channel protocol while this crate grows higher-level route-payment APIs.
 pub mod upstream {
@@ -318,10 +551,12 @@ pub mod upstream {
 #[cfg(test)]
 mod tests {
     use super::{
-        CashuSpilmanPayment, StreamingRouteAccessState, StreamingRouteBalanceUpdate,
-        StreamingRouteChannelOpen, StreamingRouteCooperativeCloseAck, StreamingRouteMeter,
-        StreamingRoutePaymentEnvelope, StreamingRoutePaymentPayload, StreamingRoutePolicy,
-        CASHU_SPILMAN_CHANNELS_REV, STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION,
+        create_streaming_route_cashu_payment, CashuSpilmanPayment, CashuSpilmanPaymentSigner,
+        StreamingRouteAccessState, StreamingRouteBalanceUpdate, StreamingRouteCashuPaymentKind,
+        StreamingRouteCashuPaymentRequest, StreamingRouteChannelOpen,
+        StreamingRouteCooperativeCloseAck, StreamingRouteMeter, StreamingRoutePaymentEnvelope,
+        StreamingRoutePaymentPayload, StreamingRoutePolicy, CASHU_SPILMAN_CHANNELS_REV,
+        STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION,
     };
 
     #[test]
@@ -473,10 +708,138 @@ mod tests {
     }
 
     #[test]
+    fn route_cashu_unit_conversions_round_up_sat_balances() {
+        assert_eq!(
+            super::streaming_route_cashu_balance_for_msat("sat", 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::streaming_route_cashu_balance_for_msat("sat", 1_001).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::streaming_route_cashu_balance_msat("sat", 2).unwrap(),
+            2_000
+        );
+        assert_eq!(
+            super::streaming_route_cashu_balance_for_msat("msat", 1_001).unwrap(),
+            1_001
+        );
+        assert_eq!(
+            super::streaming_route_cashu_capacity_for_sat("msat", 2).unwrap(),
+            2_000
+        );
+        assert_eq!(
+            super::streaming_route_cashu_capacity_sat("msat", 2_001).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn route_cashu_payment_builder_signs_open_with_funding() {
+        let signer = FakeSigner;
+        let result = create_streaming_route_cashu_payment(
+            &signer,
+            StreamingRouteCashuPaymentRequest {
+                kind: StreamingRouteCashuPaymentKind::ChannelOpen,
+                channel_id: "channel-1".to_string(),
+                unit: "sat".to_string(),
+                paid_msat: 1,
+                previous_paid_msat: 0,
+                capacity_sat: 10,
+            },
+        )
+        .expect("create payment");
+
+        assert_eq!(result.balance, 1);
+        assert_eq!(result.paid_msat, 1_000);
+        assert!(result.include_funding);
+        assert!(result.payment.has_funding());
+        assert_eq!(result.payment.signature, "sig-channel-1-1-funding");
+    }
+
+    #[test]
+    fn route_cashu_payment_builder_signs_updates_without_funding() {
+        let signer = FakeSigner;
+        let result = create_streaming_route_cashu_payment(
+            &signer,
+            StreamingRouteCashuPaymentRequest {
+                kind: StreamingRouteCashuPaymentKind::BalanceUpdate,
+                channel_id: "channel-1".to_string(),
+                unit: "msat".to_string(),
+                paid_msat: 1_500,
+                previous_paid_msat: 1_000,
+                capacity_sat: 2,
+            },
+        )
+        .expect("create payment");
+
+        assert_eq!(result.balance, 1_500);
+        assert_eq!(result.paid_msat, 1_500);
+        assert!(!result.include_funding);
+        assert!(!result.payment.has_funding());
+        assert_eq!(result.payment.signature, "sig-channel-1-1500-update");
+    }
+
+    #[test]
+    fn route_cashu_payment_builder_rejects_regressions_and_over_capacity() {
+        let signer = FakeSigner;
+        let regression = create_streaming_route_cashu_payment(
+            &signer,
+            StreamingRouteCashuPaymentRequest {
+                kind: StreamingRouteCashuPaymentKind::BalanceUpdate,
+                channel_id: "channel-1".to_string(),
+                unit: "sat".to_string(),
+                paid_msat: 999,
+                previous_paid_msat: 1_000,
+                capacity_sat: 2,
+            },
+        )
+        .expect_err("regression should fail");
+        assert!(regression.contains("regressed"));
+
+        let over_capacity = create_streaming_route_cashu_payment(
+            &signer,
+            StreamingRouteCashuPaymentRequest {
+                kind: StreamingRouteCashuPaymentKind::BalanceUpdate,
+                channel_id: "channel-1".to_string(),
+                unit: "sat".to_string(),
+                paid_msat: 2_001,
+                previous_paid_msat: 0,
+                capacity_sat: 2,
+            },
+        )
+        .expect_err("over capacity should fail");
+        assert!(over_capacity.contains("exceeds channel capacity"));
+    }
+
+    #[test]
     fn spilman_upstream_base_is_recorded() {
         assert_eq!(
             CASHU_SPILMAN_CHANNELS_REV,
             "bafc38f220e46289bebf157014ab1129c7deac63"
         );
+    }
+
+    struct FakeSigner;
+
+    impl CashuSpilmanPaymentSigner for FakeSigner {
+        fn sign_cashu_spilman_payment(
+            &self,
+            channel_id: &str,
+            balance: u64,
+            include_funding: bool,
+        ) -> Result<CashuSpilmanPayment, String> {
+            Ok(CashuSpilmanPayment {
+                channel_id: channel_id.to_string(),
+                balance,
+                signature: format!(
+                    "sig-{channel_id}-{balance}-{}",
+                    if include_funding { "funding" } else { "update" }
+                ),
+                params: include_funding.then(|| serde_json::json!({"ok": true})),
+                funding_proofs: include_funding.then(|| serde_json::json!([])),
+            })
+        }
     }
 }
