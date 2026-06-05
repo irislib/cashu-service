@@ -45,6 +45,35 @@ pub struct StreamingRoutePolicy {
     pub grace_units: u64,
 }
 
+/// Seller routing state implied by route usage and the latest signed balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingRouteAccessState {
+    /// Usage is still inside the seller's free probe allowance.
+    FreeProbe,
+    /// The latest signed balance fully covers current usage.
+    Paid,
+    /// Routing may continue, but only because the grace window still covers
+    /// unpaid usage while the buyer sends a fresh balance update.
+    Grace,
+    /// Routing should stop until the buyer provides a larger signed balance.
+    Suspended,
+}
+
+/// Route gating decision for a metered Spilman-backed route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteDecision {
+    pub state: StreamingRouteAccessState,
+    pub allow_routing: bool,
+    pub delivered_units: u64,
+    pub paid_msat: u64,
+    pub amount_due_msat: u64,
+    pub enforced_amount_due_msat: u64,
+    pub unpaid_msat: u64,
+    pub free_probe_remaining_units: u64,
+    pub grace_remaining_units: u64,
+}
+
 impl StreamingRoutePolicy {
     /// Computes the millisats due for delivered route usage.
     pub fn amount_due_msat(&self, delivered_units: u64) -> u64 {
@@ -60,12 +89,43 @@ impl StreamingRoutePolicy {
 
     /// Returns true when a signed balance is sufficient to keep routing.
     pub fn is_balance_sufficient(&self, delivered_units: u64, paid_msat: u64) -> bool {
-        if delivered_units <= self.free_probe_units.saturating_add(self.grace_units) {
-            return true;
-        }
+        self.routing_decision(delivered_units, paid_msat)
+            .allow_routing
+    }
 
+    /// Computes the current route-gating decision from delivered usage and the
+    /// latest signed Spilman balance.
+    pub fn routing_decision(&self, delivered_units: u64, paid_msat: u64) -> StreamingRouteDecision {
+        let amount_due_msat = self.amount_due_msat(delivered_units);
+        let free_probe_remaining_units = self.free_probe_units.saturating_sub(delivered_units);
+        let grace_limit_units = self.free_probe_units.saturating_add(self.grace_units);
+        let grace_remaining_units = grace_limit_units.saturating_sub(delivered_units);
         let enforced_units = delivered_units.saturating_sub(self.grace_units);
-        paid_msat >= self.amount_due_msat(enforced_units)
+        let enforced_amount_due_msat = self.amount_due_msat(enforced_units);
+        let allow_routing =
+            delivered_units <= grace_limit_units || paid_msat >= enforced_amount_due_msat;
+        let unpaid_msat = amount_due_msat.saturating_sub(paid_msat);
+        let state = if delivered_units <= self.free_probe_units {
+            StreamingRouteAccessState::FreeProbe
+        } else if paid_msat >= amount_due_msat {
+            StreamingRouteAccessState::Paid
+        } else if allow_routing {
+            StreamingRouteAccessState::Grace
+        } else {
+            StreamingRouteAccessState::Suspended
+        };
+
+        StreamingRouteDecision {
+            state,
+            allow_routing,
+            delivered_units,
+            paid_msat,
+            amount_due_msat,
+            enforced_amount_due_msat,
+            unpaid_msat,
+            free_probe_remaining_units,
+            grace_remaining_units,
+        }
     }
 }
 
@@ -91,7 +151,10 @@ pub mod upstream {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingRouteMeter, StreamingRoutePolicy, CASHU_SPILMAN_CHANNELS_REV};
+    use super::{
+        StreamingRouteAccessState, StreamingRouteMeter, StreamingRoutePolicy,
+        CASHU_SPILMAN_CHANNELS_REV,
+    };
 
     #[test]
     fn route_policy_charges_only_after_free_probe() {
@@ -111,6 +174,41 @@ mod tests {
         assert!(policy.is_balance_sufficient(119, 0));
         assert!(policy.is_balance_sufficient(130, 25));
         assert!(!policy.is_balance_sufficient(130, 24));
+    }
+
+    #[test]
+    fn route_policy_reports_free_paid_grace_and_suspended_states() {
+        let policy = StreamingRoutePolicy {
+            meter: StreamingRouteMeter::Bytes,
+            price_msat: 25,
+            per_units: 10,
+            max_channel_capacity_sat: 100,
+            channel_expiry_secs: 600,
+            free_probe_units: 100,
+            grace_units: 20,
+        };
+
+        let free = policy.routing_decision(100, 0);
+        assert_eq!(free.state, StreamingRouteAccessState::FreeProbe);
+        assert!(free.allow_routing);
+        assert_eq!(free.amount_due_msat, 0);
+
+        let paid = policy.routing_decision(130, 75);
+        assert_eq!(paid.state, StreamingRouteAccessState::Paid);
+        assert!(paid.allow_routing);
+        assert_eq!(paid.unpaid_msat, 0);
+
+        let grace = policy.routing_decision(130, 25);
+        assert_eq!(grace.state, StreamingRouteAccessState::Grace);
+        assert!(grace.allow_routing);
+        assert_eq!(grace.amount_due_msat, 75);
+        assert_eq!(grace.enforced_amount_due_msat, 25);
+        assert_eq!(grace.unpaid_msat, 50);
+
+        let suspended = policy.routing_decision(130, 24);
+        assert_eq!(suspended.state, StreamingRouteAccessState::Suspended);
+        assert!(!suspended.allow_routing);
+        assert_eq!(suspended.unpaid_msat, 51);
     }
 
     #[test]
