@@ -218,6 +218,40 @@ pub struct StreamingRouteCashuPaymentResult {
     pub include_funding: bool,
 }
 
+/// Request for a fixed Cashu-token lease payment.
+///
+/// This is a fallback/dev mode for callers that cannot open a streaming
+/// Spilman channel yet. The token is opaque to this crate; higher-level code
+/// should redeem or verify it with the configured Cashu wallet before treating
+/// the lease as settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuTokenLeaseRequest {
+    pub channel_id: String,
+    pub mint_url: String,
+    #[serde(default = "default_streaming_route_cashu_unit")]
+    pub unit: String,
+    /// Token amount in `unit`.
+    pub amount: u64,
+    /// Optional route-credit amount. Defaults to the token amount converted to
+    /// millisats and must not exceed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_msat: Option<u64>,
+    pub expires_unix: u64,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuTokenLease {
+    pub channel_id: String,
+    pub mint_url: String,
+    #[serde(default = "default_streaming_route_cashu_unit")]
+    pub unit: String,
+    pub amount: u64,
+    pub paid_msat: u64,
+    pub expires_unix: u64,
+    pub token: String,
+}
+
 /// Small signer facade implemented by the local upstream Spilman client bridge.
 ///
 /// Tests and app code can depend on this trait without coupling storage,
@@ -294,6 +328,42 @@ pub fn create_streaming_route_cashu_payment<S: CashuSpilmanPaymentSigner>(
     })
 }
 
+pub fn create_streaming_route_cashu_token_lease(
+    request: StreamingRouteCashuTokenLeaseRequest,
+) -> Result<StreamingRouteCashuTokenLease, String> {
+    let channel_id = request.channel_id.trim();
+    if channel_id.is_empty() {
+        return Err("missing Cashu token lease id".to_string());
+    }
+    let mint_url = request.mint_url.trim();
+    if mint_url.is_empty() {
+        return Err("missing Cashu token mint URL".to_string());
+    }
+    let token = request.token.trim();
+    if token.is_empty() {
+        return Err("missing Cashu token".to_string());
+    }
+    let unit = StreamingRouteCashuUnit::parse(&request.unit)?;
+    let max_paid_msat = unit.balance_to_msat(request.amount);
+    let paid_msat = request.paid_msat.unwrap_or(max_paid_msat);
+    if paid_msat > max_paid_msat {
+        return Err(format!(
+            "paid route token lease credit {} msat exceeds token amount {} msat",
+            paid_msat, max_paid_msat
+        ));
+    }
+
+    Ok(StreamingRouteCashuTokenLease {
+        channel_id: channel_id.to_string(),
+        mint_url: mint_url.to_string(),
+        unit: unit.as_str().to_string(),
+        amount: request.amount,
+        paid_msat,
+        expires_unix: request.expires_unix,
+        token: token.to_string(),
+    })
+}
+
 /// Transport-neutral payment message for a metered route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamingRoutePaymentEnvelope {
@@ -347,6 +417,9 @@ pub enum StreamingRoutePaymentPayload {
     /// Seller acknowledges close processing. Settlement receipt format is
     /// deliberately opaque while the upstream protocol is experimental.
     CooperativeCloseAck(StreamingRouteCooperativeCloseAck),
+    /// Fixed Cashu token payment for a prepaid lease. This is a fallback/dev
+    /// path; streaming Spilman channels remain the default for metered usage.
+    CashuTokenLease(StreamingRouteCashuTokenLease),
 }
 
 impl StreamingRoutePaymentPayload {
@@ -356,6 +429,7 @@ impl StreamingRoutePaymentPayload {
             Self::BalanceUpdate(update) => &update.payment.channel_id,
             Self::CooperativeClose(close) => &close.payment.channel_id,
             Self::CooperativeCloseAck(ack) => &ack.channel_id,
+            Self::CashuTokenLease(lease) => &lease.channel_id,
         }
     }
 }
@@ -551,12 +625,13 @@ pub mod upstream {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_streaming_route_cashu_payment, CashuSpilmanPayment, CashuSpilmanPaymentSigner,
-        StreamingRouteAccessState, StreamingRouteBalanceUpdate, StreamingRouteCashuPaymentKind,
-        StreamingRouteCashuPaymentRequest, StreamingRouteChannelOpen,
-        StreamingRouteCooperativeCloseAck, StreamingRouteMeter, StreamingRoutePaymentEnvelope,
-        StreamingRoutePaymentPayload, StreamingRoutePolicy, CASHU_SPILMAN_CHANNELS_REV,
-        STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION,
+        create_streaming_route_cashu_payment, create_streaming_route_cashu_token_lease,
+        CashuSpilmanPayment, CashuSpilmanPaymentSigner, StreamingRouteAccessState,
+        StreamingRouteBalanceUpdate, StreamingRouteCashuPaymentKind,
+        StreamingRouteCashuPaymentRequest, StreamingRouteCashuTokenLeaseRequest,
+        StreamingRouteChannelOpen, StreamingRouteCooperativeCloseAck, StreamingRouteMeter,
+        StreamingRoutePaymentEnvelope, StreamingRoutePaymentPayload, StreamingRoutePolicy,
+        CASHU_SPILMAN_CHANNELS_REV, STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION,
     };
 
     #[test]
@@ -683,9 +758,75 @@ mod tests {
                 closed_at_unix: 456,
                 receipt: Some(serde_json::json!({"ok":true})),
             });
+        let token = StreamingRoutePaymentPayload::CashuTokenLease(
+            create_streaming_route_cashu_token_lease(StreamingRouteCashuTokenLeaseRequest {
+                channel_id: "token-lease-4".to_string(),
+                mint_url: "https://mint.example".to_string(),
+                unit: "sat".to_string(),
+                amount: 2,
+                paid_msat: Some(1_500),
+                expires_unix: 789,
+                token: "cashuAdevtoken".to_string(),
+            })
+            .expect("token lease"),
+        );
 
         assert_eq!(update.channel_id(), "channel-2");
         assert_eq!(ack.channel_id(), "channel-3");
+        assert_eq!(token.channel_id(), "token-lease-4");
+    }
+
+    #[test]
+    fn route_token_lease_payment_round_trips_and_caps_credit() {
+        let token_lease =
+            create_streaming_route_cashu_token_lease(StreamingRouteCashuTokenLeaseRequest {
+                channel_id: "token-lease-1".to_string(),
+                mint_url: "https://mint.example".to_string(),
+                unit: "sat".to_string(),
+                amount: 2,
+                paid_msat: Some(1_500),
+                expires_unix: 999,
+                token: "cashuBtoken".to_string(),
+            })
+            .expect("create token lease");
+        assert_eq!(token_lease.paid_msat, 1_500);
+
+        let envelope = StreamingRoutePaymentEnvelope::new(
+            "internet-exit",
+            "lease-1",
+            "npub1buyer",
+            "npub1seller",
+            123,
+            StreamingRoutePaymentPayload::CashuTokenLease(token_lease),
+        );
+
+        let encoded = serde_json::to_string(&envelope).expect("serialize envelope");
+        assert!(encoded.contains(r#""type":"cashu_token_lease""#));
+        let decoded: StreamingRoutePaymentEnvelope =
+            serde_json::from_str(&encoded).expect("decode envelope");
+        assert_eq!(decoded.channel_id(), "token-lease-1");
+        match decoded.payload {
+            StreamingRoutePaymentPayload::CashuTokenLease(lease) => {
+                assert_eq!(lease.unit, "sat");
+                assert_eq!(lease.amount, 2);
+                assert_eq!(lease.paid_msat, 1_500);
+                assert_eq!(lease.token, "cashuBtoken");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let too_much =
+            create_streaming_route_cashu_token_lease(StreamingRouteCashuTokenLeaseRequest {
+                channel_id: "token-lease-2".to_string(),
+                mint_url: "https://mint.example".to_string(),
+                unit: "sat".to_string(),
+                amount: 2,
+                paid_msat: Some(2_001),
+                expires_unix: 999,
+                token: "cashuBtoken".to_string(),
+            })
+            .expect_err("over-credit should fail");
+        assert!(too_much.contains("exceeds token amount"));
     }
 
     #[cfg(feature = "spilman")]
