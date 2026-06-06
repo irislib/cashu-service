@@ -418,6 +418,7 @@ version = "0.2.56"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cashu",
  "cdk",
  "cdk-common",
  "cdk-spilman",

@@ -4,9 +4,15 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "spilman-configurable-host")]
+use cashu::nuts::{CurrencyUnit, Id, PublicKey};
+#[cfg(feature = "spilman-configurable-host")]
+use cdk_spilman::{ChannelFunding, ChannelPolicy, ChannelState, ClosingData, PaymentProof};
 
 #[cfg(feature = "spilman-configurable-host")]
 use crate::spilman::{
@@ -98,8 +104,171 @@ impl FileSpilmanPaymentReceiverConfig {
 #[cfg(feature = "spilman-configurable-host")]
 #[derive(Debug)]
 pub struct FileSpilmanPaymentReceiver {
-    bridge: cdk_spilman::SpilmanBridge<cdk_spilman::configurable_host::ConfigurableHost, String>,
+    host: Arc<cdk_spilman::configurable_host::ConfigurableHost>,
+    bridge: cdk_spilman::SpilmanBridge<SharedConfigurableHost, String>,
     receiver_pubkey_hex: String,
+}
+
+#[cfg(feature = "spilman-configurable-host")]
+#[derive(Debug, Clone)]
+struct SharedConfigurableHost(Arc<cdk_spilman::configurable_host::ConfigurableHost>);
+
+#[cfg(feature = "spilman-configurable-host")]
+impl cdk_spilman::SpilmanHost<String> for SharedConfigurableHost {
+    fn receiver_key_is_acceptable(&self, receiver_pubkey: &PublicKey) -> bool {
+        cdk_spilman::SpilmanHost::receiver_key_is_acceptable(&*self.0, receiver_pubkey)
+    }
+
+    fn mint_and_keyset_is_acceptable(&self, mint: &str, keyset_id: &Id) -> bool {
+        cdk_spilman::SpilmanHost::mint_and_keyset_is_acceptable(&*self.0, mint, keyset_id)
+    }
+
+    fn get_funding(&self, channel_id: &str) -> Option<ChannelFunding> {
+        cdk_spilman::SpilmanHost::get_funding(&*self.0, channel_id)
+    }
+
+    fn save_funding(
+        &self,
+        channel_id: &str,
+        funding: ChannelFunding,
+        initial_payment: PaymentProof,
+    ) {
+        cdk_spilman::SpilmanHost::save_funding(&*self.0, channel_id, funding, initial_payment);
+    }
+
+    fn get_amount_due(&self, channel_id: &str, context: Option<&String>) -> u64 {
+        cdk_spilman::SpilmanHost::get_amount_due(&*self.0, channel_id, context)
+    }
+
+    fn record_payment(&self, channel_id: &str, payment: PaymentProof, context: &String) {
+        cdk_spilman::SpilmanHost::record_payment(&*self.0, channel_id, payment, context);
+    }
+
+    fn get_channel_state(&self, channel_id: &str) -> ChannelState {
+        cdk_spilman::SpilmanHost::get_channel_state(&*self.0, channel_id)
+    }
+
+    fn mark_channel_closing(
+        &self,
+        channel_id: &str,
+        expiry_timestamp: u64,
+        payment: PaymentProof,
+    ) -> Result<(), String> {
+        cdk_spilman::SpilmanHost::mark_channel_closing(
+            &*self.0,
+            channel_id,
+            expiry_timestamp,
+            payment,
+        )
+    }
+
+    fn get_closing_data(&self, channel_id: &str) -> Option<ClosingData> {
+        cdk_spilman::SpilmanHost::get_closing_data(&*self.0, channel_id)
+    }
+
+    fn get_channel_policy(&self, unit: &str) -> Option<ChannelPolicy> {
+        cdk_spilman::SpilmanHost::get_channel_policy(&*self.0, unit)
+    }
+
+    fn now_seconds(&self) -> u64 {
+        cdk_spilman::SpilmanHost::now_seconds(&*self.0)
+    }
+
+    fn get_balance_and_signature_for_unilateral_exit(
+        &self,
+        channel_id: &str,
+    ) -> Option<PaymentProof> {
+        cdk_spilman::SpilmanHost::get_balance_and_signature_for_unilateral_exit(
+            &*self.0, channel_id,
+        )
+    }
+
+    fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id> {
+        cdk_spilman::SpilmanHost::get_active_keyset_ids(&*self.0, mint, unit)
+    }
+
+    fn get_keyset_info(&self, mint: &str, keyset_id: &Id) -> Option<String> {
+        cdk_spilman::SpilmanHost::get_keyset_info(&*self.0, mint, keyset_id)
+    }
+
+    fn mark_channel_closed(
+        &self,
+        channel_id: &str,
+        expiry_timestamp: u64,
+        balance: u64,
+        receiver_proofs_json: &str,
+        sender_proofs_json: &str,
+        receiver_sum: u64,
+        sender_sum: u64,
+    ) -> Result<(), String> {
+        cdk_spilman::SpilmanHost::mark_channel_closed(
+            &*self.0,
+            channel_id,
+            expiry_timestamp,
+            balance,
+            receiver_proofs_json,
+            sender_proofs_json,
+            receiver_sum,
+            sender_sum,
+        )
+    }
+
+    fn compute_channel_secret(
+        &self,
+        receiver_pubkey_hex: &str,
+        sender_pubkey_hex: &str,
+    ) -> Result<String, String> {
+        cdk_spilman::SpilmanHost::compute_channel_secret(
+            &*self.0,
+            receiver_pubkey_hex,
+            sender_pubkey_hex,
+        )
+    }
+
+    fn sign_with_tweaked_key(
+        &self,
+        signer_pubkey_hex: &str,
+        message_hex: &str,
+        tweak_scalar_hex: &str,
+    ) -> Result<String, String> {
+        cdk_spilman::SpilmanHost::sign_with_tweaked_key(
+            &*self.0,
+            signer_pubkey_hex,
+            message_hex,
+            tweak_scalar_hex,
+        )
+    }
+}
+
+#[cfg(feature = "spilman-configurable-host")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CashuSpilmanReceiverCloseResult {
+    pub channel_id: String,
+    pub closed_amount: u64,
+    pub total_value: u64,
+    pub receiver_sum: u64,
+    pub sender_sum: u64,
+    pub receiver_proofs_json: String,
+    pub sender_proofs_json: String,
+    pub already_closed: bool,
+}
+
+#[cfg(feature = "spilman-configurable-host")]
+fn cashu_spilman_receiver_close_result_from_closed_data(
+    channel_id: &str,
+    closed: cdk_spilman::configurable_host::ClosedDataView,
+    already_closed: bool,
+) -> CashuSpilmanReceiverCloseResult {
+    CashuSpilmanReceiverCloseResult {
+        channel_id: channel_id.to_string(),
+        closed_amount: closed.closed_amount,
+        total_value: closed.value_after_stage1,
+        receiver_sum: closed.receiver_sum,
+        sender_sum: closed.sender_sum,
+        receiver_proofs_json: closed.receiver_proofs_json,
+        sender_proofs_json: closed.sender_proofs_json,
+        already_closed,
+    }
 }
 
 #[cfg(feature = "spilman-configurable-host")]
@@ -107,7 +276,8 @@ impl FileSpilmanPaymentReceiver {
     pub fn load(data_dir: &Path, config: FileSpilmanPaymentReceiverConfig) -> Result<Self, String> {
         let (host, receiver_pubkey_hex) = file_spilman_receiver_host(data_dir, config)?;
         Ok(Self {
-            bridge: cdk_spilman::SpilmanBridge::new(host),
+            bridge: cdk_spilman::SpilmanBridge::new(SharedConfigurableHost(Arc::clone(&host))),
+            host,
             receiver_pubkey_hex,
         })
     }
@@ -120,13 +290,55 @@ impl FileSpilmanPaymentReceiver {
         let (host, receiver_pubkey_hex) = file_spilman_receiver_host(data_dir, config)?;
         host.initialize_keysets().await?;
         Ok(Self {
-            bridge: cdk_spilman::SpilmanBridge::new(host),
+            bridge: cdk_spilman::SpilmanBridge::new(SharedConfigurableHost(Arc::clone(&host))),
+            host,
             receiver_pubkey_hex,
         })
     }
 
     pub fn receiver_pubkey_hex(&self) -> &str {
         &self.receiver_pubkey_hex
+    }
+
+    #[cfg(feature = "spilman-configurable-host-reqwest")]
+    pub async fn close_cashu_spilman_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<CashuSpilmanReceiverCloseResult, String> {
+        let channel_id = channel_id.trim();
+        if channel_id.is_empty() {
+            return Err("missing Cashu Spilman channel id".to_string());
+        }
+        if let Some(closed) = self.host.get_closed_data(channel_id) {
+            return Ok(cashu_spilman_receiver_close_result_from_closed_data(
+                channel_id, closed, true,
+            ));
+        }
+
+        let networking =
+            cdk_spilman::configurable_networking::ReqwestNetworking::new(Arc::clone(&self.host));
+        let closed = self
+            .bridge
+            .execute_unilateral_close_async(channel_id, &networking)
+            .await
+            .map_err(|error| error.to_string())?;
+        match self.host.get_closed_data(channel_id) {
+            Some(closed_data) => Ok(cashu_spilman_receiver_close_result_from_closed_data(
+                channel_id,
+                closed_data,
+                closed.already_closed,
+            )),
+            None => Ok(CashuSpilmanReceiverCloseResult {
+                channel_id: closed.channel_id,
+                closed_amount: closed.receiver_sum,
+                total_value: closed.total_value,
+                receiver_sum: closed.receiver_sum,
+                sender_sum: closed.sender_sum,
+                receiver_proofs_json: String::new(),
+                sender_proofs_json: closed.sender_proofs,
+                already_closed: closed.already_closed,
+            }),
+        }
     }
 }
 
@@ -183,11 +395,20 @@ pub fn load_or_create_cashu_spilman_receiver_key(
 fn file_spilman_receiver_host(
     data_dir: &Path,
     config: FileSpilmanPaymentReceiverConfig,
-) -> Result<(cdk_spilman::configurable_host::ConfigurableHost, String), String> {
+) -> Result<
+    (
+        Arc<cdk_spilman::configurable_host::ConfigurableHost>,
+        String,
+    ),
+    String,
+> {
     let key = load_or_create_cashu_spilman_receiver_key(data_dir)?;
     let config = config.normalized()?;
     let host_config = spilman_host_config(data_dir, &config);
-    let host = cdk_spilman::configurable_host::ConfigurableHost::new(host_config, &key.secret_hex)?;
+    let host = Arc::new(cdk_spilman::configurable_host::ConfigurableHost::new(
+        host_config,
+        &key.secret_hex,
+    )?);
     let receiver_pubkey_hex = host.server_pubkey().to_hex();
     if receiver_pubkey_hex != key.public_key_hex {
         return Err("Spilman receiver key public key does not match host".to_string());
