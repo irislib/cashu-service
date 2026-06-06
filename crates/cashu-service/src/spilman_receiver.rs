@@ -244,6 +244,8 @@ impl cdk_spilman::SpilmanHost<String> for SharedConfigurableHost {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashuSpilmanReceiverCloseResult {
     pub channel_id: String,
+    pub mint_url: String,
+    pub unit: String,
     pub closed_amount: u64,
     pub total_value: u64,
     pub receiver_sum: u64,
@@ -256,11 +258,15 @@ pub struct CashuSpilmanReceiverCloseResult {
 #[cfg(feature = "spilman-configurable-host")]
 fn cashu_spilman_receiver_close_result_from_closed_data(
     channel_id: &str,
+    mint_url: String,
+    unit: String,
     closed: cdk_spilman::configurable_host::ClosedDataView,
     already_closed: bool,
 ) -> CashuSpilmanReceiverCloseResult {
     CashuSpilmanReceiverCloseResult {
         channel_id: channel_id.to_string(),
+        mint_url,
+        unit,
         closed_amount: closed.closed_amount,
         total_value: closed.value_after_stage1,
         receiver_sum: closed.receiver_sum,
@@ -269,6 +275,35 @@ fn cashu_spilman_receiver_close_result_from_closed_data(
         sender_proofs_json: closed.sender_proofs_json,
         already_closed,
     }
+}
+
+#[cfg(feature = "spilman-configurable-host")]
+fn cashu_spilman_receiver_channel_mint_unit(
+    host: &cdk_spilman::configurable_host::ConfigurableHost,
+    channel_id: &str,
+) -> (String, String) {
+    host.get_funding_data(channel_id)
+        .and_then(|funding| serde_json::from_str::<serde_json::Value>(&funding.params_json).ok())
+        .map(|params| {
+            let mint_url = params
+                .get("mint")
+                .or_else(|| params.get("mint_url"))
+                .and_then(|mint| mint.as_str())
+                .map(normalize_mint_url)
+                .unwrap_or_default();
+            let unit = params
+                .get("unit")
+                .and_then(|unit| unit.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| StreamingRouteCashuUnit::Sat.as_str().to_string());
+            (mint_url, unit)
+        })
+        .unwrap_or_else(|| {
+            (
+                String::new(),
+                StreamingRouteCashuUnit::Sat.as_str().to_string(),
+            )
+        })
 }
 
 #[cfg(feature = "spilman-configurable-host")]
@@ -309,9 +344,10 @@ impl FileSpilmanPaymentReceiver {
         if channel_id.is_empty() {
             return Err("missing Cashu Spilman channel id".to_string());
         }
+        let (mint_url, unit) = cashu_spilman_receiver_channel_mint_unit(&self.host, channel_id);
         if let Some(closed) = self.host.get_closed_data(channel_id) {
             return Ok(cashu_spilman_receiver_close_result_from_closed_data(
-                channel_id, closed, true,
+                channel_id, mint_url, unit, closed, true,
             ));
         }
 
@@ -325,11 +361,15 @@ impl FileSpilmanPaymentReceiver {
         match self.host.get_closed_data(channel_id) {
             Some(closed_data) => Ok(cashu_spilman_receiver_close_result_from_closed_data(
                 channel_id,
+                mint_url,
+                unit,
                 closed_data,
                 closed.already_closed,
             )),
             None => Ok(CashuSpilmanReceiverCloseResult {
                 channel_id: closed.channel_id,
+                mint_url,
+                unit,
                 closed_amount: closed.receiver_sum,
                 total_value: closed.total_value,
                 receiver_sum: closed.receiver_sum,

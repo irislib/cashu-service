@@ -1,13 +1,15 @@
 use anyhow::{bail, Context, Result};
 use cdk::cdk_database::WalletDatabase;
 use cdk::mint_url::MintUrl;
-use cdk::nuts::{CurrencyUnit, MeltQuoteState, MintQuoteState, PaymentMethod, Token};
-use cdk::wallet::{ReceiveOptions, SendOptions, WalletRepository, WalletRepositoryBuilder};
+use cdk::nuts::{CurrencyUnit, MeltQuoteState, MintQuoteState, PaymentMethod, Proof, State, Token};
+use cdk::wallet::{
+    types::ProofInfo, ReceiveOptions, SendOptions, WalletRepository, WalletRepositoryBuilder,
+};
 use cdk::Amount;
 use cdk_sqlite::WalletSqliteDatabase;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -73,6 +75,7 @@ pub enum CashuWalletActivityKind {
     LightningPayment,
     TokenSend,
     TokenReceive,
+    ChannelCollect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -678,6 +681,92 @@ pub async fn receive_payment_token(
     Ok(payment)
 }
 
+pub async fn import_payment_proofs(
+    data_dir: &Path,
+    mint_url: &str,
+    unit: &str,
+    proofs_json: &str,
+) -> Result<CashuReceivedPayment> {
+    let unit = unit.trim();
+    if unit != CurrencyUnit::Sat.to_string() {
+        bail!("Unsupported Cashu proof unit: {unit}");
+    }
+
+    let normalized_mint = normalize_mint_url(mint_url)?;
+    let mint_url =
+        MintUrl::from_str(&normalized_mint).context("Failed to parse normalized mint URL")?;
+    let proofs: Vec<Proof> =
+        serde_json::from_str(proofs_json).context("Failed to parse Cashu payment proofs")?;
+
+    let repository = open_wallet_repository(data_dir).await?;
+    let wallet = ensure_sat_wallet(&repository, &mint_url).await?;
+    wallet
+        .recover_incomplete_sagas()
+        .await
+        .context("Failed to recover Cashu wallet state before importing proofs")?;
+
+    let mut proof_infos = Vec::with_capacity(proofs.len());
+    for proof in proofs {
+        proof_infos.push(
+            ProofInfo::new(proof, mint_url.clone(), State::Unspent, CurrencyUnit::Sat)
+                .context("Failed to prepare Cashu proof import")?,
+        );
+    }
+
+    let existing_ys = wallet
+        .localstore
+        .get_proofs_by_ys(proof_infos.iter().map(|proof| proof.y).collect())
+        .await
+        .context("Failed to check existing Cashu proofs")?
+        .into_iter()
+        .map(|proof| proof.y.to_string())
+        .collect::<HashSet<_>>();
+
+    let mut imported_amount_sat = 0_u64;
+    let proof_infos = proof_infos
+        .into_iter()
+        .filter(|proof| !existing_ys.contains(&proof.y.to_string()))
+        .inspect(|proof| {
+            imported_amount_sat = imported_amount_sat.saturating_add(proof.proof.amount.to_u64());
+        })
+        .collect::<Vec<_>>();
+
+    if !proof_infos.is_empty() {
+        wallet
+            .localstore
+            .update_proofs(proof_infos, vec![])
+            .await
+            .context("Failed to import Cashu proofs into wallet")?;
+
+        append_wallet_activity_entry(
+            data_dir,
+            CashuWalletActivityEntry {
+                id: wallet_activity_id(),
+                kind: CashuWalletActivityKind::ChannelCollect,
+                status: CashuWalletActivityStatus::Complete,
+                mint_url: normalized_mint.clone(),
+                unit: CurrencyUnit::Sat.to_string(),
+                amount_sat: imported_amount_sat,
+                fee_sat: None,
+                created_at_unix: wallet_activity_now_unix(),
+                expires_at_unix: None,
+                quote_id: None,
+                operation_id: None,
+                payment_request: None,
+                token: None,
+            },
+        )
+        .await
+        .context("Failed to record Cashu channel collection activity")?;
+    }
+
+    Ok(CashuReceivedPayment {
+        mint_url: normalized_mint,
+        unit: CurrencyUnit::Sat.to_string(),
+        amount_sat: imported_amount_sat,
+    })
+}
+
 pub async fn revoke_pending_payment(
     data_dir: &Path,
     mint_url: &str,
@@ -1019,13 +1108,17 @@ mod tests {
         }
     }
 
-    fn make_proof_info(keyset_id: Id, amount: u64, mint_url: MintUrl) -> ProofInfo {
-        let proof = Proof::new(
+    fn make_test_proof(keyset_id: Id, amount: u64) -> Proof {
+        Proof::new(
             Amount::from(amount),
             keyset_id,
             Secret::generate(),
             SecretKey::generate().public_key(),
-        );
+        )
+    }
+
+    fn make_proof_info(keyset_id: Id, amount: u64, mint_url: MintUrl) -> ProofInfo {
+        let proof = make_test_proof(keyset_id, amount);
         ProofInfo::new(proof, mint_url, State::Unspent, CurrencyUnit::Sat).unwrap()
     }
 
@@ -1165,6 +1258,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("parse Cashu token"));
+    }
+
+    #[tokio::test]
+    async fn test_import_payment_proofs_adds_spendable_balance() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let keyset = build_test_keyset(16);
+        let proofs = vec![make_test_proof(keyset.id, 4), make_test_proof(keyset.id, 8)];
+        let proofs_json = serde_json::to_string(&proofs).unwrap();
+
+        let imported = import_payment_proofs(
+            temp_dir.path(),
+            "https://mint.example/",
+            "sat",
+            &proofs_json,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(imported.mint_url, "https://mint.example");
+        assert_eq!(imported.unit, "sat");
+        assert_eq!(imported.amount_sat, 12);
+
+        let overview = load_wallet_overview(temp_dir.path(), false).await.unwrap();
+        assert_eq!(
+            overview.entries,
+            vec![CashuWalletEntry {
+                mint_url: "https://mint.example".to_string(),
+                unit: "sat".to_string(),
+                balance: 12,
+            }]
+        );
+
+        let activity = load_wallet_activity(temp_dir.path()).await.unwrap();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].kind, CashuWalletActivityKind::ChannelCollect);
+        assert_eq!(activity[0].amount_sat, 12);
+    }
+
+    #[tokio::test]
+    async fn test_import_payment_proofs_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let keyset = build_test_keyset(16);
+        let proofs = vec![make_test_proof(keyset.id, 4), make_test_proof(keyset.id, 8)];
+        let proofs_json = serde_json::to_string(&proofs).unwrap();
+
+        let first =
+            import_payment_proofs(temp_dir.path(), "https://mint.example", "sat", &proofs_json)
+                .await
+                .unwrap();
+        let second =
+            import_payment_proofs(temp_dir.path(), "https://mint.example", "sat", &proofs_json)
+                .await
+                .unwrap();
+
+        assert_eq!(first.amount_sat, 12);
+        assert_eq!(second.amount_sat, 0);
+        let overview = load_wallet_overview(temp_dir.path(), false).await.unwrap();
+        assert_eq!(overview.entries[0].balance, 12);
+        let activity = load_wallet_activity(temp_dir.path()).await.unwrap();
+        assert_eq!(activity.len(), 1);
     }
 
     #[tokio::test]
