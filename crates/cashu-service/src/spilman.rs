@@ -230,6 +230,22 @@ pub struct StreamingRouteCashuPaymentClaimValidation {
     pub has_funding: bool,
 }
 
+/// Normalized result of receiver-side Cashu-Spilman payment validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CashuSpilmanPaymentReceiverValidation {
+    pub channel_id: String,
+    pub balance: u64,
+    pub amount_due: u64,
+    pub capacity: u64,
+}
+
+/// Combined application-layer route claim and receiver-side Spilman result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuPaymentReceiverValidation {
+    pub claim: StreamingRouteCashuPaymentClaimValidation,
+    pub receiver: CashuSpilmanPaymentReceiverValidation,
+}
+
 /// Request for a fixed Cashu-token lease payment.
 ///
 /// This is a fallback/dev mode for callers that cannot open a streaming
@@ -283,6 +299,24 @@ pub trait CashuSpilmanPaymentSigner {
     ) -> Result<CashuSpilmanPayment, String> {
         self.sign_cashu_spilman_payment(channel_id, final_balance, false)
     }
+}
+
+/// Small receiver facade implemented by the upstream Spilman bridge.
+///
+/// Services can depend on this trait and the serializable payment snapshot
+/// instead of coupling directly to `cdk-spilman` request/response types.
+pub trait CashuSpilmanPaymentReceiver<C = String> {
+    fn validate_cashu_spilman_payment(
+        &self,
+        payment: &CashuSpilmanPayment,
+        context: &C,
+    ) -> Result<CashuSpilmanPaymentReceiverValidation, String>;
+
+    fn process_cashu_spilman_payment(
+        &self,
+        payment: &CashuSpilmanPayment,
+        context: &C,
+    ) -> Result<CashuSpilmanPaymentReceiverValidation, String>;
 }
 
 pub fn create_streaming_route_cashu_payment<S: CashuSpilmanPaymentSigner>(
@@ -397,6 +431,75 @@ pub fn validate_streaming_route_cashu_payment_claim(
         capacity_msat,
         has_funding: payment.has_funding(),
     })
+}
+
+pub fn validate_streaming_route_cashu_payment_with_receiver<R, C>(
+    receiver: &R,
+    payment: &CashuSpilmanPayment,
+    expected_channel_id: &str,
+    unit: &str,
+    claimed_paid_msat: u64,
+    capacity_sat: u64,
+    require_funding: bool,
+    context: &C,
+) -> Result<StreamingRouteCashuPaymentReceiverValidation, String>
+where
+    R: CashuSpilmanPaymentReceiver<C>,
+{
+    let claim = validate_streaming_route_cashu_payment_claim(
+        payment,
+        expected_channel_id,
+        unit,
+        claimed_paid_msat,
+        capacity_sat,
+        require_funding,
+    )?;
+    let receiver_validation = receiver.validate_cashu_spilman_payment(payment, context)?;
+    streaming_route_receiver_validation_from_parts(claim, receiver_validation)
+}
+
+pub fn process_streaming_route_cashu_payment_with_receiver<R, C>(
+    receiver: &R,
+    payment: &CashuSpilmanPayment,
+    expected_channel_id: &str,
+    unit: &str,
+    claimed_paid_msat: u64,
+    capacity_sat: u64,
+    require_funding: bool,
+    context: &C,
+) -> Result<StreamingRouteCashuPaymentReceiverValidation, String>
+where
+    R: CashuSpilmanPaymentReceiver<C>,
+{
+    let claim = validate_streaming_route_cashu_payment_claim(
+        payment,
+        expected_channel_id,
+        unit,
+        claimed_paid_msat,
+        capacity_sat,
+        require_funding,
+    )?;
+    let receiver_validation = receiver.process_cashu_spilman_payment(payment, context)?;
+    streaming_route_receiver_validation_from_parts(claim, receiver_validation)
+}
+
+fn streaming_route_receiver_validation_from_parts(
+    claim: StreamingRouteCashuPaymentClaimValidation,
+    receiver: CashuSpilmanPaymentReceiverValidation,
+) -> Result<StreamingRouteCashuPaymentReceiverValidation, String> {
+    if receiver.channel_id.trim() != claim.channel_id {
+        return Err(format!(
+            "Cashu Spilman receiver validated channel {} but route claim expected {}",
+            receiver.channel_id, claim.channel_id
+        ));
+    }
+    if receiver.balance != claim.balance {
+        return Err(format!(
+            "Cashu Spilman receiver validated balance {} but route claim expected {}",
+            receiver.balance, claim.balance
+        ));
+    }
+    Ok(StreamingRouteCashuPaymentReceiverValidation { claim, receiver })
 }
 
 pub fn create_streaming_route_cashu_token_lease(
@@ -673,6 +776,60 @@ where
     }
 }
 
+#[cfg(feature = "spilman")]
+impl<H, C> CashuSpilmanPaymentReceiver<C> for upstream::SpilmanBridge<H, C>
+where
+    H: upstream::SpilmanHost<C>,
+{
+    fn validate_cashu_spilman_payment(
+        &self,
+        payment: &CashuSpilmanPayment,
+        context: &C,
+    ) -> Result<CashuSpilmanPaymentReceiverValidation, String> {
+        let payment = upstream::Payment::try_from(payment.clone())?;
+        let validated = self
+            .validate_payment(
+                &payment.channel_id,
+                payment.balance,
+                &payment.signature,
+                payment.params.as_ref(),
+                payment.funding_proofs.as_deref(),
+                context,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(CashuSpilmanPaymentReceiverValidation {
+            channel_id: validated.channel_id,
+            balance: validated.balance,
+            amount_due: validated.amount_due,
+            capacity: validated.capacity,
+        })
+    }
+
+    fn process_cashu_spilman_payment(
+        &self,
+        payment: &CashuSpilmanPayment,
+        context: &C,
+    ) -> Result<CashuSpilmanPaymentReceiverValidation, String> {
+        let payment = upstream::Payment::try_from(payment.clone())?;
+        let processed = self
+            .process_payment(
+                &payment.channel_id,
+                payment.balance,
+                &payment.signature,
+                payment.params.as_ref(),
+                payment.funding_proofs.as_deref(),
+                context,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(CashuSpilmanPaymentReceiverValidation {
+            channel_id: processed.channel_id,
+            balance: processed.balance,
+            amount_due: processed.amount_due,
+            capacity: processed.capacity,
+        })
+    }
+}
+
 /// Re-exports of the pinned implementation crate for callers that need the
 /// channel protocol while this crate grows higher-level route-payment APIs.
 pub mod upstream {
@@ -697,7 +854,10 @@ pub mod upstream {
 mod tests {
     use super::{
         create_streaming_route_cashu_payment, create_streaming_route_cashu_token_lease,
-        validate_streaming_route_cashu_payment_claim, CashuSpilmanPayment,
+        process_streaming_route_cashu_payment_with_receiver,
+        validate_streaming_route_cashu_payment_claim,
+        validate_streaming_route_cashu_payment_with_receiver, CashuSpilmanPayment,
+        CashuSpilmanPaymentReceiver, CashuSpilmanPaymentReceiverValidation,
         CashuSpilmanPaymentSigner, StreamingRouteAccessState, StreamingRouteBalanceUpdate,
         StreamingRouteCashuPaymentKind, StreamingRouteCashuPaymentRequest,
         StreamingRouteCashuTokenLeaseRequest, StreamingRouteChannelOpen,
@@ -1087,6 +1247,108 @@ mod tests {
     }
 
     #[test]
+    fn route_cashu_payment_receiver_validation_combines_claim_and_receiver_result() {
+        let payment = CashuSpilmanPayment {
+            channel_id: "channel-1".to_string(),
+            balance: 2,
+            signature: "sig-2".to_string(),
+            params: Some(serde_json::json!({"ok": true})),
+            funding_proofs: Some(serde_json::json!([])),
+        };
+        let receiver = FakeReceiver {
+            channel_id: "channel-1".to_string(),
+            balance: 2,
+            amount_due: 1,
+            capacity: 10,
+        };
+        let context = "route-usage".to_string();
+
+        let validated = validate_streaming_route_cashu_payment_with_receiver(
+            &receiver,
+            &payment,
+            "channel-1",
+            "sat",
+            2_000,
+            10,
+            true,
+            &context,
+        )
+        .expect("validate with receiver");
+
+        assert_eq!(validated.claim.paid_msat, 2_000);
+        assert_eq!(validated.receiver.channel_id, "channel-1");
+        assert_eq!(validated.receiver.balance, 2);
+        assert_eq!(validated.receiver.amount_due, 1);
+        assert_eq!(validated.receiver.capacity, 10);
+    }
+
+    #[test]
+    fn route_cashu_payment_receiver_processing_combines_claim_and_receiver_result() {
+        let payment = CashuSpilmanPayment {
+            channel_id: "channel-2".to_string(),
+            balance: 2_500,
+            signature: "sig-2500".to_string(),
+            params: None,
+            funding_proofs: None,
+        };
+        let receiver = FakeReceiver {
+            channel_id: "channel-2".to_string(),
+            balance: 2_500,
+            amount_due: 2_000,
+            capacity: 10_000,
+        };
+        let context = "route-usage".to_string();
+
+        let processed = process_streaming_route_cashu_payment_with_receiver(
+            &receiver,
+            &payment,
+            "channel-2",
+            "msat",
+            2_500,
+            10,
+            false,
+            &context,
+        )
+        .expect("process with receiver");
+
+        assert_eq!(processed.claim.unit, "msat");
+        assert_eq!(processed.claim.paid_msat, 2_500);
+        assert_eq!(processed.receiver.amount_due, 2_000);
+    }
+
+    #[test]
+    fn route_cashu_payment_receiver_validation_rejects_receiver_mismatch() {
+        let payment = CashuSpilmanPayment {
+            channel_id: "channel-1".to_string(),
+            balance: 2,
+            signature: "sig-2".to_string(),
+            params: Some(serde_json::json!({"ok": true})),
+            funding_proofs: Some(serde_json::json!([])),
+        };
+        let receiver = FakeReceiver {
+            channel_id: "channel-1".to_string(),
+            balance: 1,
+            amount_due: 1,
+            capacity: 10,
+        };
+        let context = "route-usage".to_string();
+
+        let error = validate_streaming_route_cashu_payment_with_receiver(
+            &receiver,
+            &payment,
+            "channel-1",
+            "sat",
+            2_000,
+            10,
+            true,
+            &context,
+        )
+        .expect_err("receiver mismatch should fail");
+
+        assert!(error.contains("receiver validated balance"));
+    }
+
+    #[test]
     fn spilman_upstream_base_is_recorded() {
         assert_eq!(
             CASHU_SPILMAN_CHANNELS_REV,
@@ -1113,6 +1375,36 @@ mod tests {
                 params: include_funding.then(|| serde_json::json!({"ok": true})),
                 funding_proofs: include_funding.then(|| serde_json::json!([])),
             })
+        }
+    }
+
+    struct FakeReceiver {
+        channel_id: String,
+        balance: u64,
+        amount_due: u64,
+        capacity: u64,
+    }
+
+    impl CashuSpilmanPaymentReceiver<String> for FakeReceiver {
+        fn validate_cashu_spilman_payment(
+            &self,
+            _payment: &CashuSpilmanPayment,
+            _context: &String,
+        ) -> Result<CashuSpilmanPaymentReceiverValidation, String> {
+            Ok(CashuSpilmanPaymentReceiverValidation {
+                channel_id: self.channel_id.clone(),
+                balance: self.balance,
+                amount_due: self.amount_due,
+                capacity: self.capacity,
+            })
+        }
+
+        fn process_cashu_spilman_payment(
+            &self,
+            payment: &CashuSpilmanPayment,
+            context: &String,
+        ) -> Result<CashuSpilmanPaymentReceiverValidation, String> {
+            self.validate_cashu_spilman_payment(payment, context)
         }
     }
 }
