@@ -18,3 +18,8 @@ pub use spilman::*;
 pub mod spilman_client;
 #[cfg(feature = "spilman")]
 pub use spilman_client::*;
+
+#[cfg(feature = "spilman-configurable-host")]
+pub mod spilman_receiver;
+#[cfg(feature = "spilman-configurable-host")]
+pub use spilman_receiver::*;

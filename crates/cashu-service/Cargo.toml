@@ -14,7 +14,12 @@ wallet = ["dep:cdk", "dep:cdk-sqlite", "dep:rand", "dep:url", "dep:hex", "dep:uu
 spilman = ["dep:cdk-spilman"]
 spilman-wallet = ["spilman", "cdk-spilman/wallet", "dep:rand", "dep:hex"]
 spilman-wallet-http = ["spilman-wallet", "dep:reqwest"]
-spilman-configurable-host = ["spilman", "cdk-spilman/configurable-host"]
+spilman-configurable-host = [
+  "spilman",
+  "cdk-spilman/configurable-host",
+  "dep:hex",
+  "dep:rand",
+]
 spilman-configurable-host-reqwest = [
   "spilman-configurable-host",
   "cdk-spilman/configurable-host-reqwest",
