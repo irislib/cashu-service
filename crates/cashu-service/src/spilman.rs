@@ -218,6 +218,18 @@ pub struct StreamingRouteCashuPaymentResult {
     pub include_funding: bool,
 }
 
+/// Normalized result of checking a route-payment claim against a signed
+/// Cashu-Spilman payment snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuPaymentClaimValidation {
+    pub channel_id: String,
+    pub unit: String,
+    pub balance: u64,
+    pub paid_msat: u64,
+    pub capacity_msat: u64,
+    pub has_funding: bool,
+}
+
 /// Request for a fixed Cashu-token lease payment.
 ///
 /// This is a fallback/dev mode for callers that cannot open a streaming
@@ -325,6 +337,65 @@ pub fn create_streaming_route_cashu_payment<S: CashuSpilmanPaymentSigner>(
         balance,
         paid_msat: unit.balance_to_msat(balance),
         include_funding,
+    })
+}
+
+/// Verify transport-neutral route accounting fields against the signed Cashu
+/// Spilman payment snapshot.
+///
+/// This does not replace upstream cryptographic validation by the receiver-side
+/// Spilman bridge. It catches application-layer mismatches before a service
+/// trusts `paid_msat`, such as a balance update claiming more route credit than
+/// the included channel balance can represent.
+pub fn validate_streaming_route_cashu_payment_claim(
+    payment: &CashuSpilmanPayment,
+    expected_channel_id: &str,
+    unit: &str,
+    claimed_paid_msat: u64,
+    capacity_sat: u64,
+    require_funding: bool,
+) -> Result<StreamingRouteCashuPaymentClaimValidation, String> {
+    let expected_channel_id = expected_channel_id.trim();
+    if expected_channel_id.is_empty() {
+        return Err("missing Cashu Spilman channel id".to_string());
+    }
+    let channel_id = payment.channel_id.trim();
+    if channel_id != expected_channel_id {
+        return Err(format!(
+            "Cashu Spilman payment channel {channel_id} does not match expected channel {expected_channel_id}"
+        ));
+    }
+    if payment.signature.trim().is_empty() {
+        return Err("Cashu Spilman payment signature is empty".to_string());
+    }
+    if require_funding && !payment.has_funding() {
+        return Err("opening Cashu Spilman payment is missing funding data".to_string());
+    }
+
+    let unit = StreamingRouteCashuUnit::parse(unit)?;
+    let paid_msat = unit.balance_to_msat(payment.balance);
+    if paid_msat != claimed_paid_msat {
+        return Err(format!(
+            "paid route payment claim {claimed_paid_msat} msat does not match Cashu Spilman balance {} {} ({} msat)",
+            payment.balance,
+            unit.as_str(),
+            paid_msat
+        ));
+    }
+    let capacity_msat = capacity_sat.saturating_mul(1_000);
+    if capacity_msat > 0 && paid_msat > capacity_msat {
+        return Err(format!(
+            "paid route payment {paid_msat} msat exceeds channel capacity {capacity_msat} msat"
+        ));
+    }
+
+    Ok(StreamingRouteCashuPaymentClaimValidation {
+        channel_id: channel_id.to_string(),
+        unit: unit.as_str().to_string(),
+        balance: payment.balance,
+        paid_msat,
+        capacity_msat,
+        has_funding: payment.has_funding(),
     })
 }
 
@@ -626,12 +697,13 @@ pub mod upstream {
 mod tests {
     use super::{
         create_streaming_route_cashu_payment, create_streaming_route_cashu_token_lease,
-        CashuSpilmanPayment, CashuSpilmanPaymentSigner, StreamingRouteAccessState,
-        StreamingRouteBalanceUpdate, StreamingRouteCashuPaymentKind,
-        StreamingRouteCashuPaymentRequest, StreamingRouteCashuTokenLeaseRequest,
-        StreamingRouteChannelOpen, StreamingRouteCooperativeCloseAck, StreamingRouteMeter,
-        StreamingRoutePaymentEnvelope, StreamingRoutePaymentPayload, StreamingRoutePolicy,
-        CASHU_SPILMAN_CHANNELS_REV, STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION,
+        validate_streaming_route_cashu_payment_claim, CashuSpilmanPayment,
+        CashuSpilmanPaymentSigner, StreamingRouteAccessState, StreamingRouteBalanceUpdate,
+        StreamingRouteCashuPaymentKind, StreamingRouteCashuPaymentRequest,
+        StreamingRouteCashuTokenLeaseRequest, StreamingRouteChannelOpen,
+        StreamingRouteCooperativeCloseAck, StreamingRouteMeter, StreamingRoutePaymentEnvelope,
+        StreamingRoutePaymentPayload, StreamingRoutePolicy, CASHU_SPILMAN_CHANNELS_REV,
+        STREAMING_ROUTE_PAYMENT_PROTOCOL_VERSION,
     };
 
     #[test]
@@ -952,6 +1024,66 @@ mod tests {
         )
         .expect_err("over capacity should fail");
         assert!(over_capacity.contains("exceeds channel capacity"));
+    }
+
+    #[test]
+    fn route_cashu_payment_claim_validation_matches_signed_balance() {
+        let payment = CashuSpilmanPayment {
+            channel_id: "channel-1".to_string(),
+            balance: 2,
+            signature: "sig-2".to_string(),
+            params: Some(serde_json::json!({"ok": true})),
+            funding_proofs: Some(serde_json::json!([])),
+        };
+        let validated = validate_streaming_route_cashu_payment_claim(
+            &payment,
+            "channel-1",
+            "sat",
+            2_000,
+            2,
+            true,
+        )
+        .expect("valid claim");
+
+        assert_eq!(validated.channel_id, "channel-1");
+        assert_eq!(validated.unit, "sat");
+        assert_eq!(validated.balance, 2);
+        assert_eq!(validated.paid_msat, 2_000);
+        assert_eq!(validated.capacity_msat, 2_000);
+        assert!(validated.has_funding);
+    }
+
+    #[test]
+    fn route_cashu_payment_claim_validation_rejects_mismatches() {
+        let payment = CashuSpilmanPayment {
+            channel_id: "channel-1".to_string(),
+            balance: 1,
+            signature: "sig-1".to_string(),
+            params: None,
+            funding_proofs: None,
+        };
+
+        let claimed_too_much = validate_streaming_route_cashu_payment_claim(
+            &payment,
+            "channel-1",
+            "sat",
+            2_000,
+            2,
+            false,
+        )
+        .expect_err("over-claimed payment should fail");
+        assert!(claimed_too_much.contains("does not match"));
+
+        let missing_funding = validate_streaming_route_cashu_payment_claim(
+            &payment,
+            "channel-1",
+            "sat",
+            1_000,
+            2,
+            true,
+        )
+        .expect_err("opening without funding should fail");
+        assert!(missing_funding.contains("missing funding"));
     }
 
     #[test]
