@@ -218,6 +218,14 @@ pub struct StreamingRouteCashuPaymentResult {
     pub include_funding: bool,
 }
 
+/// Normalized result of validating a route-payment state transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteCashuPaymentProgressValidation {
+    pub paid_msat: u64,
+    pub previous_paid_msat: u64,
+    pub capacity_msat: u64,
+}
+
 /// Normalized result of checking a route-payment claim against a signed
 /// Cashu-Spilman payment snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,19 +336,12 @@ pub fn create_streaming_route_cashu_payment<S: CashuSpilmanPaymentSigner>(
         return Err("missing Cashu Spilman channel id".to_string());
     }
     let unit = StreamingRouteCashuUnit::parse(&request.unit)?;
-    if request.paid_msat < request.previous_paid_msat {
-        return Err(format!(
-            "paid route payment amount regressed: {} msat < {} msat",
-            request.paid_msat, request.previous_paid_msat
-        ));
-    }
-    let capacity_msat = request.capacity_sat.saturating_mul(1_000);
-    if capacity_msat > 0 && request.paid_msat > capacity_msat {
-        return Err(format!(
-            "paid route payment {} msat exceeds channel capacity {} msat",
-            request.paid_msat, capacity_msat
-        ));
-    }
+    validate_streaming_route_cashu_payment_progress(
+        "paid route payment",
+        request.paid_msat,
+        request.previous_paid_msat,
+        request.capacity_sat,
+    )?;
 
     let balance = unit.balance_from_msat(request.paid_msat);
     let include_funding = request.kind.include_funding();
@@ -371,6 +372,41 @@ pub fn create_streaming_route_cashu_payment<S: CashuSpilmanPaymentSigner>(
         balance,
         paid_msat: unit.balance_to_msat(balance),
         include_funding,
+    })
+}
+
+/// Validate the monotonic paid-balance transition for a streaming route channel.
+///
+/// This helper is intentionally deterministic and transport-neutral so buyers,
+/// sellers, CLIs, and native surfaces can reject stale/replayed balance updates
+/// without duplicating capacity and regression checks.
+pub fn validate_streaming_route_cashu_payment_progress(
+    label: &str,
+    paid_msat: u64,
+    previous_paid_msat: u64,
+    capacity_sat: u64,
+) -> Result<StreamingRouteCashuPaymentProgressValidation, String> {
+    let label = if label.trim().is_empty() {
+        "paid route payment"
+    } else {
+        label.trim()
+    };
+    if paid_msat < previous_paid_msat {
+        return Err(format!(
+            "{label} amount regressed: {paid_msat} msat < {previous_paid_msat} msat"
+        ));
+    }
+    let capacity_msat = capacity_sat.saturating_mul(1_000);
+    if capacity_msat > 0 && paid_msat > capacity_msat {
+        return Err(format!(
+            "{label} {paid_msat} msat exceeds channel capacity {capacity_msat} msat"
+        ));
+    }
+
+    Ok(StreamingRouteCashuPaymentProgressValidation {
+        paid_msat,
+        previous_paid_msat,
+        capacity_msat,
     })
 }
 
@@ -1181,6 +1217,38 @@ mod tests {
                 previous_paid_msat: 0,
                 capacity_sat: 2,
             },
+        )
+        .expect_err("over capacity should fail");
+        assert!(over_capacity.contains("exceeds channel capacity"));
+    }
+
+    #[test]
+    fn route_cashu_payment_progress_validation_rejects_replay_and_capacity() {
+        let ok = super::validate_streaming_route_cashu_payment_progress(
+            "paid route balance update",
+            2_000,
+            1_000,
+            2,
+        )
+        .expect("progress is valid");
+        assert_eq!(ok.previous_paid_msat, 1_000);
+        assert_eq!(ok.paid_msat, 2_000);
+        assert_eq!(ok.capacity_msat, 2_000);
+
+        let replay = super::validate_streaming_route_cashu_payment_progress(
+            "paid route balance update",
+            999,
+            1_000,
+            2,
+        )
+        .expect_err("replay/regression should fail");
+        assert!(replay.contains("paid route balance update amount regressed"));
+
+        let over_capacity = super::validate_streaming_route_cashu_payment_progress(
+            "paid route balance update",
+            2_001,
+            1_000,
+            2,
         )
         .expect_err("over capacity should fail");
         assert!(over_capacity.contains("exceeds channel capacity"));
