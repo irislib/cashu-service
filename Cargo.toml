@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.56"
+version = "0.2.57"
 edition = "2021"
 license = "MIT"
 repository = "https://git.iris.to/#/npub1xdhnr9mrv47kkrn95k6cwecearydeh8e895990n3acntwvmgk2dsdeeycm/cashu-service"
@@ -16,11 +16,11 @@ authors = ["Martti Malmi"]
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
-cdk-spilman = { path = "../cashu_spilman_channels/crates/cdk-spilman", default-features = false }
-cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cdk", default-features = false }
-cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cashu", default-features = false }
-cdk-common = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cdk-common", default-features = false }
-cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cdk-sqlite", default-features = false }
+cdk-spilman = { version = "0.15.1", path = "../cashu_spilman_channels/crates/cdk-spilman", default-features = false }
+cdk = { version = "=0.16.0-rc.1", git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cdk", default-features = false }
+cashu = { version = "=0.16.0-rc.1", git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cashu", default-features = false }
+cdk-common = { version = "=0.16.0-rc.1", git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cdk-common", default-features = false }
+cdk-sqlite = { version = "=0.16.0-rc.1", git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cdk-sqlite", default-features = false }
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
