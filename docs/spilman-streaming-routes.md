@@ -2,8 +2,8 @@
 
 `cashu-service` can optionally expose the experimental
 `SatsAndSports/cashu_spilman_channels` implementation behind the `spilman` feature. The dependency
-is a sibling checkout at `../cashu_spilman_channels` so local protocol fixes can be made and tested
-without copying the implementation into this repository.
+resolves from crates.io by default. Local protocol fixes can be tested from a sibling checkout with
+a Cargo `patch.crates-io.cdk-spilman.path` override, without changing the publishable manifest.
 
 The target paid-connectivity flow is:
 
@@ -19,8 +19,7 @@ The target paid-connectivity flow is:
 This avoids the worst fixed-lease failure mode for public exits: a seller should not receive a full
 prepayment before proving that it can route traffic.
 
-The upstream protocol is early-alpha and the local checkout records its upstream base revision. Keep
-application-facing types in this repository so FIPS, Nostr VPN, and other consumers do not take a
-direct dependency on unstable upstream APIs. If this becomes effectively ours, move only the Rust
-core into a dedicated crate with preserved history/license instead of copying the whole multi-language
-repository.
+The upstream protocol is early-alpha. Keep application-facing types in this repository so FIPS,
+Nostr VPN, and other consumers do not take a direct dependency on unstable upstream APIs. If this
+becomes effectively ours, move only the Rust core into a dedicated crate with preserved
+history/license instead of copying the whole multi-language repository.
