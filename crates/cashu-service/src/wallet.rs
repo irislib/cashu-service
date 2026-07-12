@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use cdk::cdk_database::WalletDatabase;
+use cdk::lightning_invoice::Bolt11Invoice;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState, MintQuoteState, PaymentMethod, Proof, State, Token};
 use cdk::wallet::{
@@ -63,10 +64,57 @@ pub struct CashuTopupQuote {
     pub expiry_unix: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CashuCrossMintTransferRequest {
+    /// Caller-owned idempotency key. Reusing it resumes or returns the same transfer.
+    pub transfer_id: String,
+    /// Caller-selected and caller-approved source mint.
+    pub source_mint_url: String,
+    /// Caller-selected and caller-approved destination mint.
+    pub destination_mint_url: String,
+    pub amount_sat: u64,
+    /// Maximum total source-side fee, including the melt reserve and wallet input fees.
+    pub max_fee_sat: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CashuCrossMintTransfer {
+    pub transfer_id: String,
+    pub source_mint_url: String,
+    pub destination_mint_url: String,
+    pub unit: String,
+    pub amount_sat: u64,
+    pub max_fee_sat: u64,
+    pub melt_fee_reserve_sat: u64,
+    pub wallet_fee_sat: u64,
+    pub fee_paid_sat: u64,
+    pub source_melt_quote_id: String,
+    pub destination_mint_quote_id: String,
+    pub destination_balance_before_sat: u64,
+    pub destination_balance_after_sat: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CashuCrossMintTransferSaga {
+    version: u32,
+    request: CashuCrossMintTransferRequest,
+    destination_balance_before_sat: u64,
+    destination_mint_quote_id: Option<String>,
+    destination_payment_request: Option<String>,
+    source_melt_quote_id: Option<String>,
+    melt_fee_reserve_sat: Option<u64>,
+    wallet_fee_sat: Option<u64>,
+    fee_paid_sat: Option<u64>,
+    result: Option<CashuCrossMintTransfer>,
+}
+
 const K_WALLET_ACTIVITY_PRIMARY_NAMESPACE: &str = "iris_wallet";
 const K_WALLET_ACTIVITY_SECONDARY_NAMESPACE: &str = "activity";
 const K_WALLET_ACTIVITY_KEY: &str = "entries";
 const K_MAX_WALLET_ACTIVITY_ENTRIES: usize = 200;
+const K_CROSS_MINT_TRANSFER_NAMESPACE: &str = "cross_mint_transfer";
+const K_CROSS_MINT_TRANSFER_VERSION: u32 = 1;
+static CROSS_MINT_TRANSFER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -519,6 +567,373 @@ pub async fn load_mint_balance(data_dir: &Path, mint_url: &str) -> Result<CashuM
     })
 }
 
+/// Move sat-denominated wallet balance between two caller-selected, approved mints.
+///
+/// `transfer_id` is an idempotency key: retries recover the stored CDK sagas and
+/// resume the same destination mint quote and source melt quote. This function
+/// deliberately performs no mint selection or trust inference.
+pub async fn transfer_between_mints(
+    data_dir: &Path,
+    request: CashuCrossMintTransferRequest,
+) -> Result<CashuCrossMintTransfer> {
+    let _guard = CROSS_MINT_TRANSFER_LOCK.lock().await;
+    let request = normalize_cross_mint_transfer_request(request)?;
+    let source_mint = MintUrl::from_str(&request.source_mint_url)
+        .context("Failed to parse normalized source mint URL")?;
+    let destination_mint = MintUrl::from_str(&request.destination_mint_url)
+        .context("Failed to parse normalized destination mint URL")?;
+    let repository = open_wallet_repository(data_dir).await?;
+    let source_wallet = ensure_sat_wallet(&repository, &source_mint).await?;
+    let destination_wallet = ensure_sat_wallet(&repository, &destination_mint).await?;
+
+    transfer_between_wallets(&source_wallet, &destination_wallet, request).await
+}
+
+fn normalize_cross_mint_transfer_request(
+    mut request: CashuCrossMintTransferRequest,
+) -> Result<CashuCrossMintTransferRequest> {
+    request.transfer_id = request.transfer_id.trim().to_string();
+    if request.transfer_id.is_empty()
+        || request.transfer_id.len() > 128
+        || !request
+            .transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("Cashu cross-mint transfer id must be 1-128 ASCII letters, digits, '-' or '_'");
+    }
+    if request.amount_sat == 0 {
+        bail!("Cashu cross-mint transfer amount must be greater than zero");
+    }
+    request
+        .amount_sat
+        .checked_mul(1_000)
+        .context("Cashu cross-mint transfer amount is too large")?;
+    request.source_mint_url = normalize_mint_url(&request.source_mint_url)?;
+    request.destination_mint_url = normalize_mint_url(&request.destination_mint_url)?;
+    if request.source_mint_url == request.destination_mint_url {
+        bail!("Cashu cross-mint transfer requires two different mints");
+    }
+    Ok(request)
+}
+
+async fn load_cross_mint_transfer_saga(
+    wallet: &cdk::wallet::Wallet,
+    transfer_id: &str,
+) -> Result<Option<CashuCrossMintTransferSaga>> {
+    let stored = wallet
+        .localstore
+        .kv_read(
+            K_WALLET_ACTIVITY_PRIMARY_NAMESPACE,
+            K_CROSS_MINT_TRANSFER_NAMESPACE,
+            transfer_id,
+        )
+        .await
+        .context("Failed to read Cashu cross-mint transfer saga")?;
+    stored
+        .map(|bytes| {
+            serde_json::from_slice(&bytes).context("Failed to parse Cashu cross-mint transfer saga")
+        })
+        .transpose()
+}
+
+async fn save_cross_mint_transfer_saga(
+    wallet: &cdk::wallet::Wallet,
+    saga: &CashuCrossMintTransferSaga,
+) -> Result<()> {
+    let encoded =
+        serde_json::to_vec(saga).context("Failed to encode Cashu cross-mint transfer saga")?;
+    wallet
+        .localstore
+        .kv_write(
+            K_WALLET_ACTIVITY_PRIMARY_NAMESPACE,
+            K_CROSS_MINT_TRANSFER_NAMESPACE,
+            &saga.request.transfer_id,
+            &encoded,
+        )
+        .await
+        .context("Failed to write Cashu cross-mint transfer saga")
+}
+
+fn validate_exact_bolt11_amount(payment_request: &str, amount_sat: u64) -> Result<()> {
+    let invoice = Bolt11Invoice::from_str(payment_request)
+        .context("Destination mint returned an invalid BOLT11 invoice")?;
+    let expected_msat = amount_sat
+        .checked_mul(1_000)
+        .context("Cashu cross-mint transfer amount is too large")?;
+    let invoice_msat = invoice
+        .amount_milli_satoshis()
+        .context("Destination mint returned an amountless BOLT11 invoice")?;
+    if invoice_msat != expected_msat {
+        bail!(
+            "Destination mint invoice amount {invoice_msat} msat does not match requested amount {expected_msat} msat"
+        );
+    }
+    Ok(())
+}
+
+async fn transfer_between_wallets(
+    source_wallet: &cdk::wallet::Wallet,
+    destination_wallet: &cdk::wallet::Wallet,
+    request: CashuCrossMintTransferRequest,
+) -> Result<CashuCrossMintTransfer> {
+    let recovered_melts = source_wallet
+        .finalize_pending_melts()
+        .await
+        .context("Failed to finalize pending source mint payments")?;
+    source_wallet
+        .recover_incomplete_sagas()
+        .await
+        .context("Failed to recover source mint wallet state")?;
+    destination_wallet
+        .recover_incomplete_sagas()
+        .await
+        .context("Failed to recover destination mint wallet state")?;
+
+    let mut saga = match load_cross_mint_transfer_saga(source_wallet, &request.transfer_id).await? {
+        Some(saga) => {
+            if saga.version != K_CROSS_MINT_TRANSFER_VERSION || saga.request != request {
+                bail!(
+                    "Cashu cross-mint transfer id {} is already bound to a different request",
+                    request.transfer_id
+                );
+            }
+            if let Some(result) = saga.result {
+                return Ok(result);
+            }
+            saga
+        }
+        None => {
+            let saga = CashuCrossMintTransferSaga {
+                version: K_CROSS_MINT_TRANSFER_VERSION,
+                request: request.clone(),
+                destination_balance_before_sat: destination_wallet
+                    .total_balance()
+                    .await
+                    .context("Failed to load destination mint balance before transfer")?
+                    .to_u64(),
+                destination_mint_quote_id: None,
+                destination_payment_request: None,
+                source_melt_quote_id: None,
+                melt_fee_reserve_sat: None,
+                wallet_fee_sat: None,
+                fee_paid_sat: None,
+                result: None,
+            };
+            save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+            saga
+        }
+    };
+
+    if saga.destination_mint_quote_id.is_none() {
+        let quote = destination_wallet
+            .mint_quote(
+                PaymentMethod::BOLT11,
+                Some(Amount::from(request.amount_sat)),
+                None,
+                None,
+            )
+            .await
+            .context("Failed to create exact destination mint quote")?;
+        if quote.amount != Some(Amount::from(request.amount_sat)) {
+            bail!("Destination mint returned an incorrect mint quote amount");
+        }
+        validate_exact_bolt11_amount(&quote.request, request.amount_sat)?;
+        saga.destination_mint_quote_id = Some(quote.id);
+        saga.destination_payment_request = Some(quote.request);
+        save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+    }
+
+    let destination_quote_id = saga
+        .destination_mint_quote_id
+        .clone()
+        .context("Cashu cross-mint saga has no destination quote id")?;
+    let payment_request = saga
+        .destination_payment_request
+        .clone()
+        .context("Cashu cross-mint saga has no destination invoice")?;
+    validate_exact_bolt11_amount(&payment_request, request.amount_sat)?;
+
+    if saga.source_melt_quote_id.is_none() {
+        let quote = source_wallet
+            .melt_quote(PaymentMethod::BOLT11, &payment_request, None, None)
+            .await
+            .context("Failed to preflight source mint melt quote")?;
+        if quote.amount != Amount::from(request.amount_sat) {
+            bail!("Source mint returned an incorrect melt quote amount");
+        }
+        let fee_reserve_sat = quote.fee_reserve.to_u64();
+        if fee_reserve_sat > request.max_fee_sat {
+            bail!(
+                "Source mint melt fee reserve {fee_reserve_sat} sat exceeds caller maximum {} sat",
+                request.max_fee_sat
+            );
+        }
+        saga.source_melt_quote_id = Some(quote.id);
+        saga.melt_fee_reserve_sat = Some(fee_reserve_sat);
+        save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+    }
+
+    let source_quote_id = saga
+        .source_melt_quote_id
+        .clone()
+        .context("Cashu cross-mint saga has no source quote id")?;
+    let source_quote = source_wallet
+        .localstore
+        .get_melt_quote(&source_quote_id)
+        .await
+        .context("Failed to load source mint melt quote")?
+        .context("Stored source mint melt quote is missing")?;
+    if source_quote.request != payment_request
+        || source_quote.amount != Amount::from(request.amount_sat)
+        || source_quote.fee_reserve.to_u64()
+            != saga
+                .melt_fee_reserve_sat
+                .context("Cashu cross-mint saga has no melt fee reserve")?
+    {
+        bail!("Stored source mint melt quote does not match the cross-mint transfer");
+    }
+
+    let mut paid_transaction = source_wallet
+        .list_transactions(Some(cdk::wallet::types::TransactionDirection::Outgoing))
+        .await
+        .context("Failed to load source mint transactions")?
+        .into_iter()
+        .find(|transaction| transaction.quote_id.as_deref() == Some(source_quote_id.as_str()));
+
+    if paid_transaction.is_none() {
+        if let Some(finalized) = recovered_melts
+            .into_iter()
+            .find(|melt| melt.quote_id() == source_quote_id)
+        {
+            if finalized.state() != MeltQuoteState::Paid {
+                bail!(
+                    "Recovered source mint payment finished in unexpected state {}",
+                    finalized.state()
+                );
+            }
+            saga.fee_paid_sat = Some(finalized.fee_paid().to_u64());
+        }
+
+        match source_quote.state {
+            MeltQuoteState::Unpaid => {
+                let prepared = source_wallet
+                    .prepare_melt(&source_quote_id, HashMap::new())
+                    .await
+                    .context("Failed to prepare source mint payment")?;
+                let wallet_fee_sat = prepared.total_fee_with_swap().to_u64();
+                let preflight_fee_sat = source_quote
+                    .fee_reserve
+                    .to_u64()
+                    .checked_add(wallet_fee_sat)
+                    .context("Cashu cross-mint fee overflow")?;
+                if preflight_fee_sat > request.max_fee_sat {
+                    prepared
+                        .cancel()
+                        .await
+                        .context("Failed to cancel over-limit source mint payment")?;
+                    bail!(
+                        "Source mint preflight fee {preflight_fee_sat} sat exceeds caller maximum {} sat",
+                        request.max_fee_sat
+                    );
+                }
+                saga.wallet_fee_sat = Some(wallet_fee_sat);
+                save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+                let finalized = prepared
+                    .confirm()
+                    .await
+                    .context("Failed to execute source mint payment")?;
+                if finalized.state() != MeltQuoteState::Paid {
+                    bail!(
+                        "Source mint payment finished in unexpected state {}",
+                        finalized.state()
+                    );
+                }
+                saga.fee_paid_sat = Some(finalized.fee_paid().to_u64());
+                save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+            }
+            MeltQuoteState::Paid => {}
+            state => bail!("Source mint payment is not recoverable from state {state}"),
+        }
+
+        paid_transaction = source_wallet
+            .list_transactions(Some(cdk::wallet::types::TransactionDirection::Outgoing))
+            .await
+            .context("Failed to reload source mint transactions")?
+            .into_iter()
+            .find(|transaction| transaction.quote_id.as_deref() == Some(source_quote_id.as_str()));
+    }
+
+    let paid_transaction =
+        paid_transaction.context("Paid source mint transfer has no durable wallet transaction")?;
+    let fee_paid_sat = paid_transaction.fee.to_u64();
+    saga.fee_paid_sat = Some(fee_paid_sat);
+    save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+
+    let destination_quote = destination_wallet
+        .check_mint_quote_status(&destination_quote_id)
+        .await
+        .context("Failed to refresh destination mint quote")?;
+    if destination_quote.amount != Some(Amount::from(request.amount_sat)) {
+        bail!("Destination mint quote amount changed during transfer");
+    }
+    if destination_quote.state == MintQuoteState::Paid {
+        destination_wallet
+            .mint(
+                &destination_quote_id,
+                cdk::amount::SplitTarget::default(),
+                None,
+            )
+            .await
+            .context("Failed to issue paid destination mint quote")?;
+    } else if destination_quote.state != MintQuoteState::Issued {
+        bail!(
+            "Paid source transfer has destination mint quote in unexpected state {}",
+            destination_quote.state
+        );
+    }
+
+    let destination_balance_after_sat = destination_wallet
+        .total_balance()
+        .await
+        .context("Failed to load destination mint balance after transfer")?
+        .to_u64();
+    let expected_balance = saga
+        .destination_balance_before_sat
+        .checked_add(request.amount_sat)
+        .context("Destination mint balance overflow")?;
+    if destination_balance_after_sat != expected_balance {
+        bail!(
+            "Destination mint balance is {destination_balance_after_sat} sat; expected {expected_balance} sat after transfer"
+        );
+    }
+    if fee_paid_sat > request.max_fee_sat {
+        bail!(
+            "Source mint charged {fee_paid_sat} sat after a maximum {} sat preflight",
+            request.max_fee_sat
+        );
+    }
+
+    let result = CashuCrossMintTransfer {
+        transfer_id: request.transfer_id.clone(),
+        source_mint_url: request.source_mint_url.clone(),
+        destination_mint_url: request.destination_mint_url.clone(),
+        unit: CurrencyUnit::Sat.to_string(),
+        amount_sat: request.amount_sat,
+        max_fee_sat: request.max_fee_sat,
+        melt_fee_reserve_sat: saga.melt_fee_reserve_sat.unwrap_or_default(),
+        wallet_fee_sat: saga.wallet_fee_sat.unwrap_or_default(),
+        fee_paid_sat,
+        source_melt_quote_id: source_quote_id,
+        destination_mint_quote_id: destination_quote_id,
+        destination_balance_before_sat: saga.destination_balance_before_sat,
+        destination_balance_after_sat,
+    };
+    saga.result = Some(result.clone());
+    save_cross_mint_transfer_saga(source_wallet, &saga).await?;
+    Ok(result)
+}
+
 pub async fn send_payment_token(
     data_dir: &Path,
     mint_url: &str,
@@ -892,26 +1307,47 @@ mod tests {
     use async_trait::async_trait;
     use cdk::cdk_database::WalletDatabase;
     use cdk::nuts::{
-        BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse,
-        CurrencyUnit, Id, KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response,
-        MeltRequest, MintInfo, MintQuoteBolt11Response, MintRequest, MintResponse, PaymentMethod,
-        Proof, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
+        BatchCheckMintQuoteRequest, BatchMintRequest, BlindSignature, CheckStateRequest,
+        CheckStateResponse, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, KeysetResponse,
+        MeltQuoteBolt11Response, MeltRequest, MintInfo, MintQuoteBolt11Response, MintRequest,
+        MintResponse, PaymentMethod, Proof, RestoreRequest, RestoreResponse, SecretKey, State,
+        SwapRequest, SwapResponse,
     };
     use cdk::secret::Secret;
     use cdk::wallet::{types::ProofInfo, MintConnector, WalletBuilder};
     use cdk::{Amount, Error};
     use cdk_common::{MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest, MintQuoteResponse};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const K_VALID_BOLT11_INVOICE: &str = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh";
     const K_TEST_EXPIRY_UNIX: u64 = 4_102_444_800;
+
+    #[derive(Debug, Default)]
+    struct CrossMintTestState {
+        paid: AtomicBool,
+        destination_amount_sat: AtomicU64,
+        delay_destination_once: AtomicBool,
+        mint_quote_calls: AtomicUsize,
+        melt_calls: AtomicUsize,
+        mint_calls: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestMintRole {
+        Source,
+        Destination,
+    }
 
     #[derive(Debug, Clone)]
     struct LightningMockMintConnector {
         keyset: KeySet,
         quote_id: String,
         preimage: String,
+        role: TestMintRole,
+        fee_reserve_sat: u64,
+        state: Arc<CrossMintTestState>,
     }
 
     impl LightningMockMintConnector {
@@ -920,6 +1356,35 @@ mod tests {
                 keyset,
                 quote_id: quote_id.to_string(),
                 preimage: preimage.to_string(),
+                role: TestMintRole::Source,
+                fee_reserve_sat: 0,
+                state: Arc::new(CrossMintTestState::default()),
+            }
+        }
+
+        fn cross_mint_source(
+            keyset: KeySet,
+            state: Arc<CrossMintTestState>,
+            fee_reserve_sat: u64,
+        ) -> Self {
+            Self {
+                keyset,
+                quote_id: "source-melt-quote".to_string(),
+                preimage: "00ff".to_string(),
+                role: TestMintRole::Source,
+                fee_reserve_sat,
+                state,
+            }
+        }
+
+        fn cross_mint_destination(keyset: KeySet, state: Arc<CrossMintTestState>) -> Self {
+            Self {
+                keyset,
+                quote_id: "destination-mint-quote".to_string(),
+                preimage: String::new(),
+                role: TestMintRole::Destination,
+                fee_reserve_sat: 0,
+                state,
             }
         }
 
@@ -970,25 +1435,81 @@ mod tests {
 
         async fn post_mint_quote(
             &self,
-            _request: MintQuoteRequest,
+            request: MintQuoteRequest,
         ) -> Result<MintQuoteResponse<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
+            if self.role != TestMintRole::Destination {
+                unreachable!("unused in Cashu Lightning payment test")
+            }
+            let MintQuoteRequest::Bolt11(request) = request else {
+                unreachable!("unused payment method in cross-mint test")
+            };
+            self.state
+                .destination_amount_sat
+                .store(request.amount.to_u64(), Ordering::SeqCst);
+            self.state.mint_quote_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MintQuoteResponse::Bolt11(MintQuoteBolt11Response {
+                quote: self.quote_id.clone(),
+                request: K_VALID_BOLT11_INVOICE.to_string(),
+                amount: Some(request.amount),
+                unit: Some(CurrencyUnit::Sat),
+                state: MintQuoteState::Unpaid,
+                expiry: Some(K_TEST_EXPIRY_UNIX),
+                pubkey: request.pubkey,
+            }))
         }
 
         async fn get_mint_quote_status(
             &self,
             _method: PaymentMethod,
-            _quote_id: &str,
+            quote_id: &str,
         ) -> Result<MintQuoteResponse<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
+            if self.role != TestMintRole::Destination || quote_id != self.quote_id {
+                unreachable!("unused in Cashu Lightning payment test")
+            }
+            let paid = self.state.paid.load(Ordering::SeqCst);
+            let delayed = paid
+                && self
+                    .state
+                    .delay_destination_once
+                    .swap(false, Ordering::SeqCst);
+            Ok(MintQuoteResponse::Bolt11(MintQuoteBolt11Response {
+                quote: self.quote_id.clone(),
+                request: K_VALID_BOLT11_INVOICE.to_string(),
+                amount: Some(Amount::from(
+                    self.state.destination_amount_sat.load(Ordering::SeqCst),
+                )),
+                unit: Some(CurrencyUnit::Sat),
+                state: if paid && !delayed {
+                    MintQuoteState::Paid
+                } else {
+                    MintQuoteState::Unpaid
+                },
+                expiry: Some(K_TEST_EXPIRY_UNIX),
+                pubkey: None,
+            }))
         }
 
         async fn post_mint(
             &self,
             _method: &PaymentMethod,
-            _request: MintRequest<String>,
+            request: MintRequest<String>,
         ) -> Result<MintResponse, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
+            if self.role != TestMintRole::Destination || request.quote != self.quote_id {
+                unreachable!("unused in Cashu Lightning payment test")
+            }
+            self.state.mint_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MintResponse {
+                signatures: request
+                    .outputs
+                    .into_iter()
+                    .map(|output| BlindSignature {
+                        amount: output.amount,
+                        keyset_id: output.keyset_id,
+                        c: SecretKey::generate().public_key(),
+                        dleq: None,
+                    })
+                    .collect(),
+            })
         }
 
         async fn post_melt_quote(
@@ -1005,7 +1526,7 @@ mod tests {
             Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
                 quote: self.quote_id.clone(),
                 amount: Amount::from(amount_msat / 1000),
-                fee_reserve: Amount::ZERO,
+                fee_reserve: Amount::from(self.fee_reserve_sat),
                 state: MeltQuoteState::Unpaid,
                 expiry: K_TEST_EXPIRY_UNIX,
                 payment_preimage: None,
@@ -1018,9 +1539,36 @@ mod tests {
         async fn get_melt_quote_status(
             &self,
             _method: PaymentMethod,
-            _quote_id: &str,
+            quote_id: &str,
         ) -> Result<MeltQuoteResponse<String>, Error> {
-            unreachable!("unused in Cashu Lightning payment test")
+            if self.role != TestMintRole::Source || quote_id != self.quote_id {
+                unreachable!("unused in Cashu Lightning payment test")
+            }
+            Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
+                quote: self.quote_id.clone(),
+                amount: Amount::from(
+                    Bolt11Invoice::from_str(K_VALID_BOLT11_INVOICE)
+                        .unwrap()
+                        .amount_milli_satoshis()
+                        .unwrap()
+                        / 1_000,
+                ),
+                fee_reserve: Amount::from(self.fee_reserve_sat),
+                state: if self.state.paid.load(Ordering::SeqCst) {
+                    MeltQuoteState::Paid
+                } else {
+                    MeltQuoteState::Unpaid
+                },
+                expiry: K_TEST_EXPIRY_UNIX,
+                payment_preimage: self
+                    .state
+                    .paid
+                    .load(Ordering::SeqCst)
+                    .then(|| self.preimage.clone()),
+                change: None,
+                request: None,
+                unit: Some(CurrencyUnit::Sat),
+            }))
         }
 
         async fn post_melt(
@@ -1031,10 +1579,12 @@ mod tests {
             if request.quote_id() != &self.quote_id {
                 return Err(Error::Custom("unexpected quote id".to_string()));
             }
+            self.state.melt_calls.fetch_add(1, Ordering::SeqCst);
+            self.state.paid.store(true, Ordering::SeqCst);
             Ok(MeltQuoteBolt11Response {
                 quote: self.quote_id.clone(),
                 amount: Amount::from(250_000_u64),
-                fee_reserve: Amount::ZERO,
+                fee_reserve: Amount::from(self.fee_reserve_sat),
                 state: MeltQuoteState::Paid,
                 expiry: K_TEST_EXPIRY_UNIX,
                 payment_preimage: Some(self.preimage.clone()),
@@ -1136,6 +1686,56 @@ mod tests {
         proofs
     }
 
+    async fn cross_mint_test_wallets(
+        fee_reserve_sat: u64,
+        state: Arc<CrossMintTestState>,
+    ) -> (cdk::wallet::Wallet, cdk::wallet::Wallet) {
+        let keyset = build_test_keyset(250_002);
+        let source_mint: MintUrl = "https://source.example".parse().unwrap();
+        let destination_mint: MintUrl = "https://destination.example".parse().unwrap();
+        let db = cdk_sqlite::wallet::memory::empty().await.unwrap();
+        db.update_proofs(
+            binary_proof_infos(source_mint.clone(), keyset.id, 250_002),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let db = Arc::new(db);
+        let source = WalletBuilder::new()
+            .mint_url(source_mint)
+            .unit(CurrencyUnit::Sat)
+            .localstore(db.clone())
+            .seed([11_u8; 64])
+            .shared_client(Arc::new(LightningMockMintConnector::cross_mint_source(
+                keyset.clone(),
+                state.clone(),
+                fee_reserve_sat,
+            )))
+            .build()
+            .unwrap();
+        let destination = WalletBuilder::new()
+            .mint_url(destination_mint)
+            .unit(CurrencyUnit::Sat)
+            .localstore(db)
+            .seed([12_u8; 64])
+            .shared_client(Arc::new(
+                LightningMockMintConnector::cross_mint_destination(keyset, state),
+            ))
+            .build()
+            .unwrap();
+        (source, destination)
+    }
+
+    fn cross_mint_request(transfer_id: &str) -> CashuCrossMintTransferRequest {
+        CashuCrossMintTransferRequest {
+            transfer_id: transfer_id.to_string(),
+            source_mint_url: "https://source.example".to_string(),
+            destination_mint_url: "https://destination.example".to_string(),
+            amount_sat: 250_000,
+            max_fee_sat: 2,
+        }
+    }
+
     #[test]
     fn test_normalize_mint_url_trims_trailing_slash_and_rejects_query() {
         assert_eq!(
@@ -1220,6 +1820,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[tokio::test]
+    async fn test_cross_mint_transfer_pays_and_issues_exact_destination_quote_once() {
+        let state = Arc::new(CrossMintTestState::default());
+        let (source, destination) = cross_mint_test_wallets(2, state.clone()).await;
+        let request = cross_mint_request("transfer_1");
+
+        let first = transfer_between_wallets(&source, &destination, request.clone())
+            .await
+            .unwrap();
+        let retry = transfer_between_wallets(&source, &destination, request)
+            .await
+            .unwrap();
+
+        assert_eq!(retry, first);
+        assert_eq!(first.amount_sat, 250_000);
+        assert_eq!(first.melt_fee_reserve_sat, 2);
+        assert_eq!(first.wallet_fee_sat, 0);
+        assert_eq!(first.fee_paid_sat, 2);
+        assert_eq!(first.source_melt_quote_id, "source-melt-quote");
+        assert_eq!(first.destination_mint_quote_id, "destination-mint-quote");
+        assert_eq!(first.destination_balance_before_sat, 0);
+        assert_eq!(first.destination_balance_after_sat, 250_000);
+        assert_eq!(state.mint_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.melt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.mint_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cross_mint_transfer_recovers_after_payment_before_destination_refresh() {
+        let state = Arc::new(CrossMintTestState::default());
+        state.delay_destination_once.store(true, Ordering::SeqCst);
+        let (source, destination) = cross_mint_test_wallets(2, state.clone()).await;
+        let request = cross_mint_request("transfer_recovery");
+
+        let interrupted = transfer_between_wallets(&source, &destination, request.clone())
+            .await
+            .unwrap_err();
+        assert!(interrupted.to_string().contains("unexpected state"));
+        assert_eq!(state.melt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(destination.total_balance().await.unwrap().to_u64(), 0);
+
+        let recovered = transfer_between_wallets(&source, &destination, request)
+            .await
+            .unwrap();
+        assert_eq!(recovered.destination_balance_after_sat, 250_000);
+        assert_eq!(state.mint_quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.melt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.mint_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cross_mint_transfer_rejects_fee_before_payment() {
+        let state = Arc::new(CrossMintTestState::default());
+        let (source, destination) = cross_mint_test_wallets(3, state.clone()).await;
+        let request = cross_mint_request("transfer_fee_limit");
+
+        let error = transfer_between_wallets(&source, &destination, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds caller maximum"));
+        assert_eq!(state.melt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.mint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(destination.total_balance().await.unwrap().to_u64(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cross_mint_transfer_rejects_wrong_invoice_amount_before_payment() {
+        let state = Arc::new(CrossMintTestState::default());
+        let (source, destination) = cross_mint_test_wallets(2, state.clone()).await;
+        let mut request = cross_mint_request("transfer_wrong_amount");
+        request.amount_sat = 249_999;
+
+        let error = transfer_between_wallets(&source, &destination, request)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match requested amount"));
+        assert_eq!(state.melt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.mint_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cross_mint_transfer_id_cannot_be_rebound() {
+        let state = Arc::new(CrossMintTestState::default());
+        let (source, destination) = cross_mint_test_wallets(2, state.clone()).await;
+        let request = cross_mint_request("transfer_bound");
+        transfer_between_wallets(&source, &destination, request.clone())
+            .await
+            .unwrap();
+        let mut changed = request;
+        changed.max_fee_sat = 3;
+
+        let error = transfer_between_wallets(&source, &destination, changed)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("bound to a different request"));
+        assert_eq!(state.melt_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
