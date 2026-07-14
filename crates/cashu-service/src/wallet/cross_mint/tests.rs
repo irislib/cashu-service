@@ -460,10 +460,23 @@ async fn test_cross_mint_transfer_recovers_after_payment_before_destination_refr
     assert_eq!(state.melt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(destination.total_balance().await.unwrap().to_u64(), 0);
 
+    // Completion must be tied to this transfer's mint quote, not to an exact
+    // whole-wallet balance delta. Other wallet activity may happen while a
+    // paid transfer is being recovered.
+    let keyset = build_test_keyset(250_002);
+    destination
+        .localstore
+        .update_proofs(
+            vec![make_proof_info(keyset.id, 1, destination.mint_url.clone())],
+            vec![],
+        )
+        .await
+        .unwrap();
+
     let recovered = transfer_between_wallets(&source, &destination, request)
         .await
         .unwrap();
-    assert_eq!(recovered.destination_balance_after_sat, 250_000);
+    assert_eq!(recovered.destination_balance_after_sat, 250_001);
     assert_eq!(state.mint_quote_calls.load(Ordering::SeqCst), 1);
     assert_eq!(state.melt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(state.mint_calls.load(Ordering::SeqCst), 1);
@@ -483,6 +496,61 @@ async fn test_cross_mint_transfer_rejects_fee_before_payment() {
     assert_eq!(state.melt_calls.load(Ordering::SeqCst), 0);
     assert_eq!(state.mint_calls.load(Ordering::SeqCst), 0);
     assert_eq!(destination.total_balance().await.unwrap().to_u64(), 0);
+}
+
+#[tokio::test]
+async fn test_cross_mint_resume_never_starts_a_new_payment() {
+    let state = Arc::new(CrossMintTestState::default());
+    let (source, destination) = cross_mint_test_wallets(2, state.clone()).await;
+
+    let error = transfer_between_wallets_with_start(
+        &source,
+        &destination,
+        cross_mint_request("missing_saga"),
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("no durable saga to resume"));
+    assert_eq!(state.mint_quote_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.melt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.mint_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_cross_mint_resume_does_not_pay_a_preflight_only_saga() {
+    let state = Arc::new(CrossMintTestState::default());
+    let (source, destination) = cross_mint_test_wallets(2, state.clone()).await;
+    let request = cross_mint_request("preflight_only");
+    save_cross_mint_transfer_saga(
+        &source,
+        &CashuCrossMintTransferSaga {
+            version: K_CROSS_MINT_TRANSFER_VERSION,
+            request: request.clone(),
+            destination_balance_before_sat: 0,
+            destination_mint_quote_id: None,
+            destination_payment_request: None,
+            source_melt_quote_id: None,
+            melt_fee_reserve_sat: None,
+            wallet_fee_sat: None,
+            fee_paid_sat: None,
+            result: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = transfer_between_wallets_with_start(&source, &destination, request, false)
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("has not started a source payment"));
+    assert_eq!(state.mint_quote_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.melt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.mint_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

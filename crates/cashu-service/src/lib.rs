@@ -4,10 +4,21 @@ pub use helper::*;
 pub mod protocol;
 pub use protocol::*;
 
+#[cfg(feature = "credit-store")]
+mod credit_store;
+#[cfg(feature = "credit-store")]
+pub use credit_store::{CreditAccountStore, CreditStoreError};
+
+#[cfg(all(feature = "simulation", test))]
+mod credit_settlement;
+
 #[cfg(feature = "wallet")]
 pub mod wallet;
 #[cfg(feature = "wallet")]
 pub use wallet::*;
+
+#[cfg(feature = "simulation")]
+pub mod simulation;
 
 #[cfg(feature = "spilman")]
 pub mod spilman;

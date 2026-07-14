@@ -6,12 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Sat-denominated bilateral credit-line protocol types for peer-issued Cashu"
+description = "Sat-denominated service receipts, bounded peer credit, and Cashu backing accounts"
 readme = "README.md"
 
 [dependencies]
 serde.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true

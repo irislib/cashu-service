@@ -132,16 +132,21 @@ impl cdk_spilman::SpilmanHost<String> for SharedConfigurableHost {
         channel_id: &str,
         funding: ChannelFunding,
         initial_payment: PaymentProof,
-    ) {
-        cdk_spilman::SpilmanHost::save_funding(&*self.0, channel_id, funding, initial_payment);
+    ) -> Result<(), String> {
+        cdk_spilman::SpilmanHost::save_funding(&*self.0, channel_id, funding, initial_payment)
     }
 
     fn get_amount_due(&self, channel_id: &str, context: Option<&String>) -> u64 {
         cdk_spilman::SpilmanHost::get_amount_due(&*self.0, channel_id, context)
     }
 
-    fn record_payment(&self, channel_id: &str, payment: PaymentProof, context: &String) {
-        cdk_spilman::SpilmanHost::record_payment(&*self.0, channel_id, payment, context);
+    fn record_payment(
+        &self,
+        channel_id: &str,
+        payment: PaymentProof,
+        context: &String,
+    ) -> Result<(), String> {
+        cdk_spilman::SpilmanHost::record_payment(&*self.0, channel_id, payment, context)
     }
 
     fn get_channel_state(&self, channel_id: &str) -> ChannelState {

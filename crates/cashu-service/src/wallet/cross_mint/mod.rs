@@ -41,7 +41,10 @@ pub struct CashuCrossMintTransfer {
     pub fee_paid_sat: u64,
     pub source_melt_quote_id: String,
     pub destination_mint_quote_id: String,
+    /// Informational whole-wallet balance observed before this transfer.
     pub destination_balance_before_sat: u64,
+    /// Informational whole-wallet balance observed after this transfer. Other
+    /// wallet activity may contribute to the difference between these fields.
     pub destination_balance_after_sat: u64,
 }
 
@@ -64,9 +67,35 @@ struct CashuCrossMintTransferSaga {
 /// `transfer_id` is an idempotency key: retries recover the stored CDK sagas and
 /// resume the same destination mint quote and source melt quote. This function
 /// deliberately performs no mint selection or trust inference.
+///
+/// The saga mutex is process-local. Run exactly one wallet writer process per
+/// `data_dir`; separate processes can otherwise start different quotes before
+/// either persists the shared transfer ID.
+///
+/// This converts liquidity into the caller's destination-mint wallet; it does
+/// not prove that a counterparty was paid. A payout application must durably
+/// journal `settlement_id -> exact bearer token -> authenticated receiver ACK`
+/// and replay that journal rather than creating another token after a crash.
 pub async fn transfer_between_mints(
     data_dir: &Path,
     request: CashuCrossMintTransferRequest,
+) -> Result<CashuCrossMintTransfer> {
+    transfer_between_mints_with_start(data_dir, request, true).await
+}
+
+/// Resume an already durable saga without permitting a new payment to start.
+#[cfg(all(feature = "simulation", test))]
+pub(crate) async fn resume_transfer_between_mints(
+    data_dir: &Path,
+    request: CashuCrossMintTransferRequest,
+) -> Result<CashuCrossMintTransfer> {
+    transfer_between_mints_with_start(data_dir, request, false).await
+}
+
+async fn transfer_between_mints_with_start(
+    data_dir: &Path,
+    request: CashuCrossMintTransferRequest,
+    allow_new: bool,
 ) -> Result<CashuCrossMintTransfer> {
     let _guard = CROSS_MINT_TRANSFER_LOCK.lock().await;
     let request = normalize_cross_mint_transfer_request(request)?;
@@ -78,7 +107,8 @@ pub async fn transfer_between_mints(
     let source_wallet = ensure_sat_wallet(&repository, &source_mint).await?;
     let destination_wallet = ensure_sat_wallet(&repository, &destination_mint).await?;
 
-    transfer_between_wallets(&source_wallet, &destination_wallet, request).await
+    transfer_between_wallets_with_start(&source_wallet, &destination_wallet, request, allow_new)
+        .await
 }
 
 fn normalize_cross_mint_transfer_request(
@@ -164,10 +194,20 @@ fn validate_exact_bolt11_amount(payment_request: &str, amount_sat: u64) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 async fn transfer_between_wallets(
     source_wallet: &cdk::wallet::Wallet,
     destination_wallet: &cdk::wallet::Wallet,
     request: CashuCrossMintTransferRequest,
+) -> Result<CashuCrossMintTransfer> {
+    transfer_between_wallets_with_start(source_wallet, destination_wallet, request, true).await
+}
+
+async fn transfer_between_wallets_with_start(
+    source_wallet: &cdk::wallet::Wallet,
+    destination_wallet: &cdk::wallet::Wallet,
+    request: CashuCrossMintTransferRequest,
+    allow_new: bool,
 ) -> Result<CashuCrossMintTransfer> {
     let recovered_melts = source_wallet
         .finalize_pending_melts()
@@ -196,6 +236,12 @@ async fn transfer_between_wallets(
             saga
         }
         None => {
+            if !allow_new {
+                bail!(
+                    "Cashu cross-mint transfer id {} has no durable saga to resume",
+                    request.transfer_id
+                );
+            }
             let saga = CashuCrossMintTransferSaga {
                 version: K_CROSS_MINT_TRANSFER_VERSION,
                 request: request.clone(),
@@ -309,6 +355,12 @@ async fn transfer_between_wallets(
 
         match source_quote.state {
             MeltQuoteState::Unpaid => {
+                if !allow_new {
+                    bail!(
+                        "Cashu cross-mint transfer id {} has not started a source payment",
+                        request.transfer_id
+                    );
+                }
                 let prepared = source_wallet
                     .prepare_melt(&source_quote_id, HashMap::new())
                     .await
@@ -385,20 +437,29 @@ async fn transfer_between_wallets(
         );
     }
 
+    let issued_quote = destination_wallet
+        .localstore
+        .get_mint_quote(&destination_quote_id)
+        .await
+        .context("Failed to load issued destination mint quote")?
+        .context("Issued destination mint quote is missing")?;
+    if issued_quote.id != destination_quote_id
+        || issued_quote.mint_url != destination_wallet.mint_url
+        || issued_quote.payment_method != PaymentMethod::BOLT11
+        || issued_quote.unit != CurrencyUnit::Sat
+        || issued_quote.amount != Some(Amount::from(request.amount_sat))
+        || issued_quote.request != payment_request
+        || issued_quote.state != MintQuoteState::Issued
+        || issued_quote.amount_issued != Amount::from(request.amount_sat)
+    {
+        bail!("Issued destination mint quote does not match the cross-mint transfer");
+    }
+
     let destination_balance_after_sat = destination_wallet
         .total_balance()
         .await
         .context("Failed to load destination mint balance after transfer")?
         .to_u64();
-    let expected_balance = saga
-        .destination_balance_before_sat
-        .checked_add(request.amount_sat)
-        .context("Destination mint balance overflow")?;
-    if destination_balance_after_sat != expected_balance {
-        bail!(
-            "Destination mint balance is {destination_balance_after_sat} sat; expected {expected_balance} sat after transfer"
-        );
-    }
     if fee_paid_sat > request.max_fee_sat {
         bail!(
             "Source mint charged {fee_paid_sat} sat after a maximum {} sat preflight",

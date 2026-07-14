@@ -5,7 +5,7 @@ Reusable Cashu primitives for paid connectivity services.
 This workspace currently has two layers:
 
 - `cashu-service`: wallet/helper plumbing for sending, receiving, and settling Cashu tokens.
-- `cashu-credit`: sat-denominated bilateral credit-line protocol types for peer-issued Cashu.
+- `cashu-credit`: sat-denominated useful-service receipts, bounded peer credit, and Cashu backing accounts.
 
 The credit model treats peer-issued Cashu as an IOU denominated in sats. A peer may accept another
 peer's issued tokens up to a local trust limit, then require settlement in an accepted Cashu mint,
