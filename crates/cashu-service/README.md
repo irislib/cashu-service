@@ -10,6 +10,7 @@ logic in each binary.
 
 - optional wallet support behind the `wallet` feature
 - validated credit-account snapshot persistence behind the `credit-store` feature
+- exact authorized-accounting to CDK route binding behind the `credit-settlement` feature
 - isolated real-CDK/fake-Lightning integration scenarios behind the `simulation` feature
 - experimental Cashu Spilman channel support behind the `spilman` feature
 - shared async helpers for invoking external payment workflows
@@ -39,3 +40,7 @@ resume that record after a crash instead of creating a second token.
 This API does not select or approve mints and must not accept a seller-provided
 mint URL as trusted input. Buyer-mode selection is a caller concern: automatic
 selection may invoke it only in Auto mode, never in Off or Manual mode.
+
+`credit-settlement` binds an already authorized accounting settlement to one
+exact CDK route. It neither chooses trust/payment policy nor proves that an
+authenticated counterparty received the resulting bearer token.

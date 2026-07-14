@@ -11,10 +11,10 @@ description = "Reusable Cashu helper and wallet primitives for paid connectivity
 [features]
 default = []
 credit-store = ["dep:cashu-credit", "dep:rusqlite", "dep:thiserror"]
+credit-settlement = ["credit-store", "wallet"]
 wallet = ["dep:cdk", "dep:cdk-sqlite", "dep:rand", "dep:url", "dep:hex", "dep:uuid"]
 simulation = [
-  "credit-store",
-  "wallet",
+  "credit-settlement",
   "dep:axum",
   "dep:cdk-axum",
   "dep:cdk-common",

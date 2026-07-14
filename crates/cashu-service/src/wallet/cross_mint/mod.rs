@@ -84,7 +84,6 @@ pub async fn transfer_between_mints(
 }
 
 /// Resume an already durable saga without permitting a new payment to start.
-#[cfg(all(feature = "simulation", test))]
 pub(crate) async fn resume_transfer_between_mints(
     data_dir: &Path,
     request: CashuCrossMintTransferRequest,

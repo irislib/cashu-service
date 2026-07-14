@@ -9,8 +9,10 @@ mod credit_store;
 #[cfg(feature = "credit-store")]
 pub use credit_store::{CreditAccountStore, CreditStoreError};
 
-#[cfg(all(feature = "simulation", test))]
+#[cfg(feature = "credit-settlement")]
 mod credit_settlement;
+#[cfg(feature = "credit-settlement")]
+pub use credit_settlement::{execute_cashu_settlement, prepare_cashu_settlement, CashuIssuerRoute};
 
 #[cfg(feature = "wallet")]
 pub mod wallet;
