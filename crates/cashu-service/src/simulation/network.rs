@@ -410,6 +410,9 @@ impl PaymentNetwork {
             amount: Amount::new(amount_sat, CurrencyUnit::Sat),
             fee: Amount::new(self.inner.fee_sat, CurrencyUnit::Sat),
             state: MeltQuoteState::Unpaid,
+            extra_json: None,
+            estimated_blocks: None,
+            fee_options: None,
         })
     }
 
@@ -619,6 +622,7 @@ impl MintPayment for SimMintPayment {
                 invoice_description: true,
             }),
             bolt12: None,
+            onchain: None,
             custom: HashMap::new(),
         })
     }
@@ -678,11 +682,11 @@ impl MintPayment for SimMintPayment {
         Ok(Box::pin(events))
     }
 
-    fn is_wait_invoice_active(&self) -> bool {
+    fn is_payment_event_stream_active(&self) -> bool {
         self.wait_active.load(Ordering::SeqCst)
     }
 
-    fn cancel_wait_invoice(&self) {
+    fn cancel_payment_event_stream(&self) {
         self.wait_active.store(false, Ordering::SeqCst);
     }
 

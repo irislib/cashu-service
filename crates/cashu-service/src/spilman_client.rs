@@ -612,54 +612,69 @@ pub async fn open_streaming_route_cashu_spilman_channel_from_wallet(
     data_dir: &Path,
     request: StreamingRouteOpenCashuSpilmanChannelFromWalletRequest,
 ) -> anyhow::Result<StreamingRouteOpenCashuSpilmanChannelFromWalletResult> {
-    if request.capacity_sat == 0 {
-        anyhow::bail!("Cashu Spilman channel capacity must be greater than zero");
-    }
-    let unit =
-        StreamingRouteCashuUnit::parse(&request.unit).map_err(|error| anyhow::anyhow!(error))?;
-    if unit != StreamingRouteCashuUnit::Sat {
-        anyhow::bail!("wallet-backed Cashu Spilman channel opening currently supports sat only");
-    }
-    let keyset_info_json = match request.keyset_info_json {
-        Some(json) => json,
-        None => fetch_spilman_keyset_info_json(
-            &request.mint_url,
-            unit.as_str(),
-            request.keyset_id.as_deref(),
+    crate::wallet::CashuWalletService::open_file_backed(data_dir)
+        .await?
+        .open_streaming_route_cashu_spilman_channel(request)
+        .await
+}
+
+#[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+impl crate::wallet::CashuWalletService {
+    pub async fn open_streaming_route_cashu_spilman_channel(
+        &self,
+        request: StreamingRouteOpenCashuSpilmanChannelFromWalletRequest,
+    ) -> anyhow::Result<StreamingRouteOpenCashuSpilmanChannelFromWalletResult> {
+        if request.capacity_sat == 0 {
+            anyhow::bail!("Cashu Spilman channel capacity must be greater than zero");
+        }
+        let unit = StreamingRouteCashuUnit::parse(&request.unit)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if unit != StreamingRouteCashuUnit::Sat {
+            anyhow::bail!(
+                "wallet-backed Cashu Spilman channel opening currently supports sat only"
+            );
+        }
+        let keyset_info_json = match request.keyset_info_json {
+            Some(json) => json,
+            None => fetch_spilman_keyset_info_json(
+                &request.mint_url,
+                unit.as_str(),
+                request.keyset_id.as_deref(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?,
+        };
+        let funding_token_amount = cdk_spilman::compute_funding_token_amount(
+            request.capacity_sat,
+            &keyset_info_json,
+            request.max_amount_per_output,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let wallet_send = self
+            .send_payment_token(&request.mint_url, funding_token_amount)
+            .await?;
+        let networking = HttpSpilmanClientNetworking::new();
+        let channel = open_streaming_route_cashu_spilman_channel_from_token_with_networking(
+            self.data_dir(),
+            StreamingRouteOpenCashuSpilmanChannelFromTokenRequest {
+                token: wallet_send.token.clone(),
+                receiver_pubkey_hex: request.receiver_pubkey_hex,
+                sender_secret_hex: None,
+                expiry_unix: request.expiry_unix,
+                keyset_info_json,
+                max_amount_per_output: request.max_amount_per_output,
+                unit: unit.as_str().to_string(),
+                opening_paid_msat: request.opening_paid_msat,
+            },
+            &networking,
         )
         .await
-        .map_err(|error| anyhow::anyhow!(error))?,
-    };
-    let funding_token_amount = cdk_spilman::compute_funding_token_amount(
-        request.capacity_sat,
-        &keyset_info_json,
-        request.max_amount_per_output,
-    )
-    .map_err(|error| anyhow::anyhow!(error))?;
-    let wallet_send =
-        crate::wallet::send_payment_token(data_dir, &request.mint_url, funding_token_amount)
-            .await?;
-    let networking = HttpSpilmanClientNetworking::new();
-    let channel = open_streaming_route_cashu_spilman_channel_from_token_with_networking(
-        data_dir,
-        StreamingRouteOpenCashuSpilmanChannelFromTokenRequest {
-            token: wallet_send.token.clone(),
-            receiver_pubkey_hex: request.receiver_pubkey_hex,
-            sender_secret_hex: None,
-            expiry_unix: request.expiry_unix,
-            keyset_info_json,
-            max_amount_per_output: request.max_amount_per_output,
-            unit: unit.as_str().to_string(),
-            opening_paid_msat: request.opening_paid_msat,
-        },
-        &networking,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!(error))?;
-    Ok(StreamingRouteOpenCashuSpilmanChannelFromWalletResult {
-        channel,
-        wallet_send,
-    })
+        .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(StreamingRouteOpenCashuSpilmanChannelFromWalletResult {
+            channel,
+            wallet_send,
+        })
+    }
 }
 
 #[cfg(feature = "spilman-wallet")]

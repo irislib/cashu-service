@@ -11,7 +11,10 @@ use cdk::nuts::{
 use cdk::secret::Secret;
 use cdk::wallet::{types::ProofInfo, MintConnector, WalletBuilder};
 use cdk::{Amount, Error};
-use cdk_common::{MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest, MintQuoteResponse};
+use cdk_common::{
+    MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest,
+    MintQuoteResponse,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -199,7 +202,7 @@ impl MintConnector for LightningMockMintConnector {
     async fn post_melt_quote(
         &self,
         request: MeltQuoteRequest,
-    ) -> Result<MeltQuoteResponse<String>, Error> {
+    ) -> Result<MeltQuoteCreateResponse<String>, Error> {
         let MeltQuoteRequest::Bolt11(request) = request else {
             unreachable!("unused payment method in Cashu Lightning payment test")
         };
@@ -207,7 +210,7 @@ impl MintConnector for LightningMockMintConnector {
             .request
             .amount_milli_satoshis()
             .ok_or(Error::InvoiceAmountUndefined)?;
-        Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
+        Ok(MeltQuoteCreateResponse::Bolt11(MeltQuoteBolt11Response {
             quote: self.quote_id.clone(),
             amount: Amount::from(amount_msat / 1000),
             fee_reserve: Amount::from(self.fee_reserve_sat),
@@ -259,13 +262,13 @@ impl MintConnector for LightningMockMintConnector {
         &self,
         _method: &PaymentMethod,
         request: MeltRequest<String>,
-    ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+    ) -> Result<MeltQuoteResponse<String>, Error> {
         if request.quote_id() != &self.quote_id {
             return Err(Error::Custom("unexpected quote id".to_string()));
         }
         self.state.melt_calls.fetch_add(1, Ordering::SeqCst);
         self.state.paid.store(true, Ordering::SeqCst);
-        Ok(MeltQuoteBolt11Response {
+        Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
             quote: self.quote_id.clone(),
             amount: Amount::from(250_000_u64),
             fee_reserve: Amount::from(self.fee_reserve_sat),
@@ -275,7 +278,7 @@ impl MintConnector for LightningMockMintConnector {
             change: None,
             request: None,
             unit: Some(CurrencyUnit::Sat),
-        })
+        }))
     }
 
     async fn post_swap(&self, _request: SwapRequest) -> Result<SwapResponse, Error> {
@@ -307,7 +310,7 @@ impl MintConnector for LightningMockMintConnector {
         &self,
         _method: &PaymentMethod,
         _request: BatchCheckMintQuoteRequest<String>,
-    ) -> Result<Vec<MintQuoteBolt11Response<String>>, Error> {
+    ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
         unreachable!("unused in Cashu Lightning payment test")
     }
 

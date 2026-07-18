@@ -9,6 +9,8 @@ logic in each binary.
 ## Features
 
 - optional wallet support behind the `wallet` feature
+- optional single-owner CDK SQLite runtime with secure-seed adapters, startup recovery,
+  and WAL-family preservation behind the `wallet` feature
 - validated credit-account snapshot persistence behind the `credit-store` feature
 - exact authorized-accounting to CDK route binding behind the `credit-settlement` feature
 - isolated real-CDK/fake-Lightning integration scenarios behind the `simulation` feature
@@ -29,8 +31,25 @@ The transfer creates the destination quote first, validates its BOLT11 amount,
 preflights the source melt and all wallet fees before payment, then issues the
 paid destination quote and verifies that exact quote was issued. Its saga is
 persisted in the wallet database, so retry the same request and `transfer_id`
-after an interruption. Saga locking is process-local: run exactly one wallet
-writer process for each wallet data directory.
+after an interruption. `CashuWalletService` holds one long-lived CDK repository,
+serializes wallet operations, and takes an exclusive cross-process lock for each
+wallet data directory. Applications may instead use CDK directly when they need
+a different ownership model.
+
+## Wallet runtime
+
+`CashuWalletService::open_with_seed_store` accepts a caller-supplied
+`CashuWalletSeedStore`. Mobile applications can implement that trait with their
+existing non-interactive Keychain or Keystore facility. A legacy
+`cashu/seed.json` is removed only after an exact secure-store round trip and a
+successful CDK database open. If the database or one of its WAL sidecars exists
+without a seed, startup fails instead of generating a replacement wallet.
+
+Call `recover_startup_state` after opening to finalize pending melts, recover
+CDK sagas, and issue paid pending quotes. Recovery reports offline mints as
+warnings and leaves the runtime usable. An unreadable database is never silently
+recreated; `preserve_cashu_wallet_database` explicitly moves the SQLite file,
+WAL, shared-memory file, and rollback journal together into a recovery directory.
 
 This conversion leaves proofs in the caller's destination-mint wallet; it is not
 evidence that a counterparty received payment. A payout application must durably

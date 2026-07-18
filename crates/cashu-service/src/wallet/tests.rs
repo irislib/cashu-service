@@ -4,15 +4,18 @@ use cdk::cdk_database::WalletDatabase;
 use cdk::nuts::{
     BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse,
     CurrencyUnit, Id, KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response,
-    MeltRequest, MintInfo, MintQuoteBolt11Response, MintRequest, MintResponse, PaymentMethod,
-    Proof, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
+    MeltRequest, MintInfo, MintRequest, MintResponse, PaymentMethod, Proof, RestoreRequest,
+    RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
 };
 use cdk::secret::Secret;
 use cdk::wallet::{types::ProofInfo, MintConnector, WalletBuilder};
 use cdk::{Amount, Error};
-use cdk_common::{MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest, MintQuoteResponse};
+use cdk_common::{
+    MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest,
+    MintQuoteResponse,
+};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const K_VALID_BOLT11_INVOICE: &str = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh";
 const K_TEST_EXPIRY_UNIX: u64 = 4_102_444_800;
@@ -104,7 +107,7 @@ impl MintConnector for LightningMockMintConnector {
     async fn post_melt_quote(
         &self,
         request: MeltQuoteRequest,
-    ) -> Result<MeltQuoteResponse<String>, Error> {
+    ) -> Result<MeltQuoteCreateResponse<String>, Error> {
         let MeltQuoteRequest::Bolt11(request) = request else {
             unreachable!("unused payment method in Cashu Lightning payment test")
         };
@@ -112,7 +115,7 @@ impl MintConnector for LightningMockMintConnector {
             .request
             .amount_milli_satoshis()
             .ok_or(Error::InvoiceAmountUndefined)?;
-        Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
+        Ok(MeltQuoteCreateResponse::Bolt11(MeltQuoteBolt11Response {
             quote: self.quote_id.clone(),
             amount: Amount::from(amount_msat / 1000),
             fee_reserve: Amount::ZERO,
@@ -137,11 +140,11 @@ impl MintConnector for LightningMockMintConnector {
         &self,
         _method: &PaymentMethod,
         request: MeltRequest<String>,
-    ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+    ) -> Result<MeltQuoteResponse<String>, Error> {
         if request.quote_id() != &self.quote_id {
             return Err(Error::Custom("unexpected quote id".to_string()));
         }
-        Ok(MeltQuoteBolt11Response {
+        Ok(MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
             quote: self.quote_id.clone(),
             amount: Amount::from(250_000_u64),
             fee_reserve: Amount::ZERO,
@@ -151,7 +154,7 @@ impl MintConnector for LightningMockMintConnector {
             change: None,
             request: None,
             unit: Some(CurrencyUnit::Sat),
-        })
+        }))
     }
 
     async fn post_swap(&self, _request: SwapRequest) -> Result<SwapResponse, Error> {
@@ -183,7 +186,7 @@ impl MintConnector for LightningMockMintConnector {
         &self,
         _method: &PaymentMethod,
         _request: BatchCheckMintQuoteRequest<String>,
-    ) -> Result<Vec<MintQuoteBolt11Response<String>>, Error> {
+    ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
         unreachable!("unused in Cashu Lightning payment test")
     }
 
@@ -274,14 +277,218 @@ fn test_cashu_wallet_seed_roundtrip_and_paths() {
     assert_eq!(restored, seed);
 }
 
+#[derive(Default)]
+struct TestWalletSeedStore {
+    seed: Mutex<Option<[u8; 64]>>,
+    stored: Mutex<Vec<[u8; 64]>>,
+    corrupt_after_store: bool,
+}
+
+impl TestWalletSeedStore {
+    fn with_seed(seed: [u8; 64]) -> Self {
+        Self {
+            seed: Mutex::new(Some(seed)),
+            ..Self::default()
+        }
+    }
+
+    fn corrupting() -> Self {
+        Self {
+            corrupt_after_store: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl CashuWalletSeedStore for TestWalletSeedStore {
+    fn load_seed(&self) -> Result<Option<[u8; 64]>> {
+        Ok(*self.seed.lock().unwrap())
+    }
+
+    fn store_seed(&self, seed: &[u8; 64]) -> Result<()> {
+        self.stored.lock().unwrap().push(*seed);
+        let stored = if self.corrupt_after_store {
+            let mut corrupted = *seed;
+            corrupted[0] ^= 0xff;
+            corrupted
+        } else {
+            *seed
+        };
+        *self.seed.lock().unwrap() = Some(stored);
+        Ok(())
+    }
+}
+
+#[test]
+fn existing_wallet_database_without_seed_is_never_reinitialized() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(cashu_wallet_dir(temp_dir.path())).unwrap();
+    fs::write(cashu_wallet_db_path(temp_dir.path()), b"existing wallet").unwrap();
+    let store = TestWalletSeedStore::default();
+
+    let error = resolve_wallet_seed(temp_dir.path(), &store, true).unwrap_err();
+
+    assert!(error.to_string().contains("wallet database exists"));
+    assert!(store.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_wallet_seed_migrates_exact_bytes_after_verified_store_roundtrip() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let legacy_seed = [42_u8; 64];
+    write_wallet_seed(&cashu_wallet_seed_path(temp_dir.path()), &legacy_seed).unwrap();
+    let store = TestWalletSeedStore::default();
+
+    let resolved = resolve_wallet_seed(temp_dir.path(), &store, true).unwrap();
+
+    assert_eq!(resolved.seed, legacy_seed);
+    assert!(resolved.remove_legacy_after_database_open);
+    assert_eq!(store.load_seed().unwrap(), Some(legacy_seed));
+    assert!(cashu_wallet_seed_path(temp_dir.path()).exists());
+}
+
+#[test]
+fn legacy_seed_is_retained_when_secure_store_roundtrip_changes_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let legacy_seed = [7_u8; 64];
+    let legacy_path = cashu_wallet_seed_path(temp_dir.path());
+    write_wallet_seed(&legacy_path, &legacy_seed).unwrap();
+    let store = TestWalletSeedStore::corrupting();
+
+    let error = resolve_wallet_seed(temp_dir.path(), &store, true).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("did not preserve the wallet seed"));
+    assert!(legacy_path.exists());
+}
+
+#[test]
+fn secure_and_legacy_seed_mismatch_is_rejected() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_wallet_seed(&cashu_wallet_seed_path(temp_dir.path()), &[1_u8; 64]).unwrap();
+    let store = TestWalletSeedStore::with_seed([2_u8; 64]);
+
+    let error = resolve_wallet_seed(temp_dir.path(), &store, true).unwrap_err();
+
+    assert!(error.to_string().contains("does not match"));
+}
+
+#[tokio::test]
+async fn secure_seed_migration_removes_legacy_file_only_after_database_opens() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let legacy_seed = [9_u8; 64];
+    let legacy_path = cashu_wallet_seed_path(temp_dir.path());
+    write_wallet_seed(&legacy_path, &legacy_seed).unwrap();
+    let store = Arc::new(TestWalletSeedStore::default());
+
+    let service = CashuWalletService::open_with_seed_store(temp_dir.path(), store.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(store.load_seed().unwrap(), Some(legacy_seed));
+    assert!(!legacy_path.exists());
+    assert!(cashu_wallet_db_path(temp_dir.path()).exists());
+    drop(service);
+}
+
+#[tokio::test]
+async fn failed_database_open_keeps_legacy_seed_for_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let legacy_seed = [10_u8; 64];
+    let legacy_path = cashu_wallet_seed_path(temp_dir.path());
+    write_wallet_seed(&legacy_path, &legacy_seed).unwrap();
+    fs::write(cashu_wallet_db_path(temp_dir.path()), b"not sqlite").unwrap();
+    let store = Arc::new(TestWalletSeedStore::default());
+
+    let error = CashuWalletService::open_with_seed_store(temp_dir.path(), store.clone())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("open Cashu wallet database"));
+    assert_eq!(store.load_seed().unwrap(), Some(legacy_seed));
+    assert!(legacy_path.exists());
+}
+
+#[tokio::test]
+async fn wallet_service_exclusively_owns_one_data_directory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(TestWalletSeedStore::default());
+    let first = CashuWalletService::open_with_seed_store(temp_dir.path(), store.clone())
+        .await
+        .unwrap();
+
+    let error = CashuWalletService::open_with_seed_store(temp_dir.path(), store)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("already in use"));
+    drop(first);
+}
+
+#[tokio::test]
+async fn startup_recovery_is_a_noop_for_an_empty_wallet() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let service = CashuWalletService::open_file_backed(temp_dir.path())
+        .await
+        .unwrap();
+
+    let report = service.recover_startup_state().await;
+
+    assert_eq!(report.wallets, 0);
+    assert_eq!(report.finalized_melts, 0);
+    assert_eq!(report.recovered_sagas, 0);
+    assert_eq!(report.compensated_sagas, 0);
+    assert_eq!(report.pending_sagas, 0);
+    assert_eq!(report.failed_sagas, 0);
+    assert_eq!(report.minted_amount, 0);
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn corrupted_wallet_database_family_is_preserved_together() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let files = cashu_wallet_database_files(temp_dir.path());
+    std::fs::create_dir_all(cashu_wallet_dir(temp_dir.path())).unwrap();
+    for (index, path) in files.iter().enumerate() {
+        std::fs::write(path, format!("database-family-{index}")).unwrap();
+    }
+
+    let recovery_dir = preserve_cashu_wallet_database(temp_dir.path())
+        .unwrap()
+        .expect("database family should be preserved");
+
+    assert!(!cashu_wallet_database_exists(temp_dir.path()));
+    for (index, original) in files.iter().enumerate() {
+        let preserved = recovery_dir.join(original.file_name().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(preserved).unwrap(),
+            format!("database-family-{index}")
+        );
+    }
+}
+
+#[test]
+fn preserving_an_absent_wallet_database_is_a_noop() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    assert!(preserve_cashu_wallet_database(temp_dir.path())
+        .unwrap()
+        .is_none());
+}
+
 #[tokio::test]
 async fn test_wallet_overview_loads_stored_wallets() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let repo = open_wallet_repository(temp_dir.path()).await.unwrap();
+    let service = CashuWalletService::open_file_backed(temp_dir.path())
+        .await
+        .unwrap();
     let mint_url: MintUrl = "https://mint.example".parse().unwrap();
-    ensure_sat_wallet(&repo, &mint_url).await.unwrap();
+    ensure_sat_wallet(service.repository(), &mint_url)
+        .await
+        .unwrap();
 
-    let overview = load_wallet_overview(temp_dir.path(), false).await.unwrap();
+    let overview = service.load_wallet_overview(false).await.unwrap();
     assert_eq!(
         overview.entries,
         vec![CashuWalletEntry {
@@ -302,11 +509,16 @@ async fn test_wallet_overview_loads_stored_wallets() {
 #[tokio::test]
 async fn test_load_mint_balance_returns_zero_for_known_wallet() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let repo = open_wallet_repository(temp_dir.path()).await.unwrap();
+    let service = CashuWalletService::open_file_backed(temp_dir.path())
+        .await
+        .unwrap();
     let mint_url: MintUrl = "https://mint.example".parse().unwrap();
-    ensure_sat_wallet(&repo, &mint_url).await.unwrap();
+    ensure_sat_wallet(service.repository(), &mint_url)
+        .await
+        .unwrap();
 
-    let balance = load_mint_balance(temp_dir.path(), "https://mint.example")
+    let balance = service
+        .load_mint_balance("https://mint.example")
         .await
         .unwrap();
     assert_eq!(balance.mint_url, "https://mint.example");
@@ -442,8 +654,12 @@ async fn test_revoke_pending_payment_rejects_invalid_operation_id() {
 async fn test_wallet_activity_pending_topup_syncs_to_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mint_url: MintUrl = "https://mint.example".parse().unwrap();
-    let repository = open_wallet_repository(temp_dir.path()).await.unwrap();
-    let wallet = ensure_sat_wallet(&repository, &mint_url).await.unwrap();
+    let service = CashuWalletService::open_file_backed(temp_dir.path())
+        .await
+        .unwrap();
+    let wallet = ensure_sat_wallet(service.repository(), &mint_url)
+        .await
+        .unwrap();
 
     let mut quote = cdk::wallet::MintQuote::new(
         "quote-1".to_string(),
@@ -459,7 +675,7 @@ async fn test_wallet_activity_pending_topup_syncs_to_complete() {
     wallet.localstore.add_mint_quote(quote).await.unwrap();
 
     append_wallet_activity_entry(
-        temp_dir.path(),
+        service.localstore().as_ref(),
         CashuWalletActivityEntry {
             id: "entry-topup".to_string(),
             kind: CashuWalletActivityKind::TopUp,
@@ -479,7 +695,7 @@ async fn test_wallet_activity_pending_topup_syncs_to_complete() {
     .await
     .unwrap();
 
-    let history = load_wallet_activity(temp_dir.path()).await.unwrap();
+    let history = service.load_wallet_activity().await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].status, CashuWalletActivityStatus::Complete);
 }
@@ -488,11 +704,15 @@ async fn test_wallet_activity_pending_topup_syncs_to_complete() {
 async fn test_wallet_activity_pending_send_syncs_to_complete_without_saga() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mint_url: MintUrl = "https://mint.example".parse().unwrap();
-    let repository = open_wallet_repository(temp_dir.path()).await.unwrap();
-    ensure_sat_wallet(&repository, &mint_url).await.unwrap();
+    let service = CashuWalletService::open_file_backed(temp_dir.path())
+        .await
+        .unwrap();
+    ensure_sat_wallet(service.repository(), &mint_url)
+        .await
+        .unwrap();
 
     append_wallet_activity_entry(
-        temp_dir.path(),
+        service.localstore().as_ref(),
         CashuWalletActivityEntry {
             id: "entry-send".to_string(),
             kind: CashuWalletActivityKind::TokenSend,
@@ -512,7 +732,7 @@ async fn test_wallet_activity_pending_send_syncs_to_complete_without_saga() {
     .await
     .unwrap();
 
-    let history = load_wallet_activity(temp_dir.path()).await.unwrap();
+    let history = service.load_wallet_activity().await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].status, CashuWalletActivityStatus::Complete);
 }

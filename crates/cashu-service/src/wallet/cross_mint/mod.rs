@@ -8,12 +8,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
-use super::{ensure_sat_wallet, normalize_mint_url, open_wallet_repository};
+use super::{ensure_sat_wallet, normalize_mint_url, CashuWalletService};
 
 const K_WALLET_NAMESPACE: &str = "iris_wallet";
 const K_CROSS_MINT_TRANSFER_NAMESPACE: &str = "cross_mint_transfer";
 const K_CROSS_MINT_TRANSFER_VERSION: u32 = 1;
-static CROSS_MINT_TRANSFER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CashuCrossMintTransferRequest {
@@ -80,7 +79,10 @@ pub async fn transfer_between_mints(
     data_dir: &Path,
     request: CashuCrossMintTransferRequest,
 ) -> Result<CashuCrossMintTransfer> {
-    transfer_between_mints_with_start(data_dir, request, true).await
+    CashuWalletService::open_file_backed(data_dir)
+        .await?
+        .transfer_between_mints(request)
+        .await
 }
 
 /// Resume an already durable saga without permitting a new payment to start.
@@ -88,26 +90,44 @@ pub(crate) async fn resume_transfer_between_mints(
     data_dir: &Path,
     request: CashuCrossMintTransferRequest,
 ) -> Result<CashuCrossMintTransfer> {
-    transfer_between_mints_with_start(data_dir, request, false).await
+    CashuWalletService::open_file_backed(data_dir)
+        .await?
+        .resume_transfer_between_mints(request)
+        .await
 }
 
-async fn transfer_between_mints_with_start(
-    data_dir: &Path,
-    request: CashuCrossMintTransferRequest,
-    allow_new: bool,
-) -> Result<CashuCrossMintTransfer> {
-    let _guard = CROSS_MINT_TRANSFER_LOCK.lock().await;
-    let request = normalize_cross_mint_transfer_request(request)?;
-    let source_mint = MintUrl::from_str(&request.source_mint_url)
-        .context("Failed to parse normalized source mint URL")?;
-    let destination_mint = MintUrl::from_str(&request.destination_mint_url)
-        .context("Failed to parse normalized destination mint URL")?;
-    let repository = open_wallet_repository(data_dir).await?;
-    let source_wallet = ensure_sat_wallet(&repository, &source_mint).await?;
-    let destination_wallet = ensure_sat_wallet(&repository, &destination_mint).await?;
+impl CashuWalletService {
+    pub async fn transfer_between_mints(
+        &self,
+        request: CashuCrossMintTransferRequest,
+    ) -> Result<CashuCrossMintTransfer> {
+        self.transfer_between_mints_with_start(request, true).await
+    }
 
-    transfer_between_wallets_with_start(&source_wallet, &destination_wallet, request, allow_new)
-        .await
+    pub(crate) async fn resume_transfer_between_mints(
+        &self,
+        request: CashuCrossMintTransferRequest,
+    ) -> Result<CashuCrossMintTransfer> {
+        self.transfer_between_mints_with_start(request, false).await
+    }
+
+    async fn transfer_between_mints_with_start(
+        &self,
+        request: CashuCrossMintTransferRequest,
+        allow_new: bool,
+    ) -> Result<CashuCrossMintTransfer> {
+        let _guard = self.lock_operation().await;
+        let request = normalize_cross_mint_transfer_request(request)?;
+        let source_mint = MintUrl::from_str(&request.source_mint_url)
+            .context("Failed to parse normalized source mint URL")?;
+        let destination_mint = MintUrl::from_str(&request.destination_mint_url)
+            .context("Failed to parse normalized destination mint URL")?;
+        let source_wallet = ensure_sat_wallet(self.repository(), &source_mint).await?;
+        let destination_wallet = ensure_sat_wallet(self.repository(), &destination_mint).await?;
+
+        transfer_between_wallets_with_start(&source_wallet, &destination_wallet, request, allow_new)
+            .await
+    }
 }
 
 fn normalize_cross_mint_transfer_request(

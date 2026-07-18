@@ -16,8 +16,8 @@ use cdk::Amount;
 use super::*;
 use crate::credit_settlement::{execute_cashu_settlement, CashuIssuerRoute};
 use crate::{
-    create_topup_quote, load_mint_balance, open_wallet_repository, receive_payment_token,
-    send_lightning_payment, send_payment_token, CreditAccountStore,
+    create_topup_quote, load_mint_balance, receive_payment_token, send_lightning_payment,
+    send_payment_token, CashuWalletService, CreditAccountStore,
 };
 
 const START_TIME: u64 = 1_700_000_000;
@@ -55,6 +55,7 @@ fn outgoing(
         max_fee_amount: max_fee_sat.map(|fee| Amount::new(fee, CurrencyUnit::Sat)),
         timeout_secs: None,
         melt_options,
+        quote_id: cdk_common::QuoteId::default(),
     }))
 }
 
@@ -350,9 +351,12 @@ async fn fund_source_wallet(
     );
     funding.settle_external(&quote.payment_request).unwrap();
 
-    let repository = open_wallet_repository(data_dir).await.unwrap();
+    let service = CashuWalletService::open_file_backed(data_dir)
+        .await
+        .unwrap();
     let mint_url = MintUrl::from_str(source.url()).unwrap();
-    let wallet = repository
+    let wallet = service
+        .repository()
         .get_wallet(&mint_url, &CurrencyUnit::Sat)
         .await
         .unwrap();
