@@ -1,8 +1,9 @@
 # Changelog
 
-## cashu-service 0.4.1 - 2026-07-20
+## cashu-service 0.4.2 - 2026-07-20
 
 - Restore deterministic Spilman sender refunds from the settlement keyset and import them into the file-backed wallet after mint key rotation.
+- Report settlement completion separately from the recovered amount, including zero-refund channels, and avoid repeat mint requests once recovery completes.
 
 ## cashu-service 0.4.0 - 2026-07-18
 

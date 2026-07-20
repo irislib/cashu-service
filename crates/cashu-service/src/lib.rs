@@ -32,6 +32,11 @@ pub mod spilman_client;
 #[cfg(feature = "spilman")]
 pub use spilman_client::*;
 
+#[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+mod spilman_refund;
+#[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+pub use spilman_refund::*;
+
 #[cfg(feature = "spilman-configurable-host")]
 pub mod spilman_receiver;
 #[cfg(feature = "spilman-configurable-host")]
