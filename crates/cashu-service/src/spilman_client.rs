@@ -471,6 +471,68 @@ impl HttpSpilmanClientNetworking {
 }
 
 #[cfg(feature = "spilman-wallet-http")]
+#[derive(Debug, Clone)]
+struct HttpSpilmanMintConnection {
+    client: reqwest::Client,
+    mint_url: String,
+}
+
+#[cfg(feature = "spilman-wallet-http")]
+impl HttpSpilmanMintConnection {
+    fn new(mint_url: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            mint_url: mint_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    async fn post_json<T, R>(&self, path: &str, request: &T) -> anyhow::Result<R>
+    where
+        T: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.mint_url))
+            .json(request)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("Cashu mint request to {path} failed with {status}: {body}");
+        }
+        serde_json::from_str(&body).map_err(Into::into)
+    }
+}
+
+#[cfg(feature = "spilman-wallet-http")]
+#[async_trait::async_trait]
+impl cdk_spilman::MintConnection for HttpSpilmanMintConnection {
+    async fn process_swap(
+        &self,
+        request: cashu::nuts::SwapRequest,
+    ) -> anyhow::Result<cashu::nuts::SwapResponse> {
+        self.post_json("/v1/swap", &request).await
+    }
+
+    async fn post_restore(
+        &self,
+        request: cashu::nuts::RestoreRequest,
+    ) -> anyhow::Result<cashu::nuts::RestoreResponse> {
+        self.post_json("/v1/restore", &request).await
+    }
+
+    async fn check_state(
+        &self,
+        ys: Vec<cashu::nuts::PublicKey>,
+    ) -> anyhow::Result<cashu::nuts::CheckStateResponse> {
+        self.post_json("/v1/checkstate", &cashu::nuts::CheckStateRequest { ys })
+            .await
+    }
+}
+
+#[cfg(feature = "spilman-wallet-http")]
 #[async_trait::async_trait]
 impl cdk_spilman::SpilmanClientAsyncNetworking for HttpSpilmanClientNetworking {
     async fn call_mint_swap(
@@ -579,6 +641,102 @@ pub async fn fetch_spilman_keyset_info_json(
         keyset_info["finalExpiry"] = serde_json::json!(final_expiry);
     }
     Ok(keyset_info.to_string())
+}
+
+#[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingRouteRestoreCashuSpilmanRefundResult {
+    pub channel_id: String,
+    pub mint_url: String,
+    pub unit: String,
+    pub recovered_amount_sat: u64,
+    pub imported_amount_sat: u64,
+    pub proof_count: usize,
+}
+
+#[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+pub async fn restore_streaming_route_cashu_spilman_refund(
+    data_dir: &Path,
+    channel_id: &str,
+) -> anyhow::Result<StreamingRouteRestoreCashuSpilmanRefundResult> {
+    use cashu::nuts::{Proof, SecretKey};
+    use cdk_spilman::ClientStorage;
+
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        anyhow::bail!("missing Cashu Spilman channel id");
+    }
+    let store_path = spilman_client_store_path(data_dir);
+    let (storage, storage_errors) =
+        FileSpilmanClientStorage::load(&store_path).map_err(|error| anyhow::anyhow!(error))?;
+    let funding = storage
+        .get_funding(channel_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Cashu Spilman channel not found: {channel_id}"))?;
+    let original_keyset = cdk_spilman::parse_keyset_info_from_json(&funding.keyset_info_json)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let channel_secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid Cashu Spilman channel secret length"))?;
+    let params = cdk_spilman::ChannelParameters::from_json_with_channel_secret(
+        &funding.params_json,
+        original_keyset,
+        channel_secret,
+    )?;
+    let funding_proofs: Vec<Proof> = serde_json::from_str(&funding.funding_proofs_json)?;
+    let channel = cdk_spilman::EstablishedChannel::new(params, funding_proofs)?;
+    let sender_key = load_or_create_cashu_spilman_sender_key(data_dir)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if sender_key.public_key_hex != funding.sender_pubkey_hex {
+        anyhow::bail!("Cashu Spilman channel sender key does not match local wallet key");
+    }
+    let sender_secret = SecretKey::from_hex(&sender_key.secret_hex)?;
+    let sender = cdk_spilman::SpilmanChannelSender::new(sender_secret, channel);
+    let unit = serde_json::from_str::<serde_json::Value>(&funding.params_json)?
+        .get("unit")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("sat")
+        .to_string();
+    let output_keyset_json = fetch_spilman_keyset_info_json(&funding.mint_url, &unit, None)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let output_keyset = cdk_spilman::parse_keyset_info_from_json(&output_keyset_json)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mint = HttpSpilmanMintConnection::new(&funding.mint_url);
+    let proofs = sender
+        .restore_sender_proofs_with_keyset(&mint, &output_keyset)
+        .await?;
+    let recovered_amount_sat = proofs
+        .iter()
+        .map(|proof| u64::from(proof.amount))
+        .sum::<u64>();
+    let proof_count = proofs.len();
+    let imported_amount_sat = if proofs.is_empty() {
+        0
+    } else {
+        let proofs_json = serde_json::to_string(&proofs)?;
+        crate::import_payment_proofs(data_dir, &funding.mint_url, &unit, &proofs_json)
+            .await?
+            .amount_sat
+    };
+    if recovered_amount_sat > 0 {
+        let (mut storage, errors) =
+            FileSpilmanClientStorage::load(store_path).map_err(|error| anyhow::anyhow!(error))?;
+        storage.set_closed(channel_id);
+        errors.ensure_ok().map_err(|error| anyhow::anyhow!(error))?;
+    }
+    storage_errors
+        .ensure_ok()
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    Ok(StreamingRouteRestoreCashuSpilmanRefundResult {
+        channel_id: channel_id.to_string(),
+        mint_url: funding.mint_url,
+        unit,
+        recovered_amount_sat,
+        imported_amount_sat,
+        proof_count,
+    })
 }
 
 #[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
@@ -817,5 +975,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("wallet-backed Cashu Spilman channel opening currently supports sat only"));
+    }
+
+    #[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+    #[tokio::test]
+    async fn refund_restore_rejects_unknown_channel_before_networking() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = restore_streaming_route_cashu_spilman_refund(temp.path(), "missing-channel")
+            .await
+            .expect_err("an unknown channel should fail before contacting a mint");
+
+        assert!(error
+            .to_string()
+            .contains("Cashu Spilman channel not found: missing-channel"));
     }
 }

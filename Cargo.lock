@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "cashu-service"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -626,9 +626,9 @@ dependencies = [
 
 [[package]]
 name = "cdk-spilman"
-version = "0.17.0"
+version = "0.17.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7b51f09ed3c97432054d53d4aacad9cef89f503faa83eb62101a2b9dd4ce2b9"
+checksum = "2deaa22b819b594b3315b50c13baeb53ea428a086a303bf8bfae7a7fbff850b7"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1,5 +1,9 @@
 # Changelog
 
+## cashu-service 0.4.1 - 2026-07-20
+
+- Restore deterministic Spilman sender refunds from the settlement keyset and import them into the file-backed wallet after mint key rotation.
+
 ## cashu-service 0.4.0 - 2026-07-18
 
 - Update Cashu/CDK, CDK SQLite, and `cdk-spilman` to the stable 0.17 line.
