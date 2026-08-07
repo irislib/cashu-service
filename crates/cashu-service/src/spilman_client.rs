@@ -3,12 +3,15 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Path, PathBuf},
     rc::Rc,
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::private_file::{
+    create_atomic_private, read_private_regular_to_string, write_atomic_private,
+};
 
 #[cfg(feature = "spilman-wallet")]
 use crate::spilman::{
@@ -89,7 +92,7 @@ impl FileSpilmanClientStorage {
         path: impl Into<PathBuf>,
     ) -> Result<(Self, FileSpilmanClientStorageErrorHandle), String> {
         let path = path.into();
-        let state = match fs::read_to_string(&path) {
+        let state = match read_private_regular_to_string(&path) {
             Ok(content) if content.trim().is_empty() => SpilmanClientStoreFile::new(),
             Ok(content) => {
                 let state: SpilmanClientStoreFile = serde_json::from_str(&content)
@@ -130,18 +133,10 @@ impl FileSpilmanClientStorage {
     }
 
     fn write_snapshot(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create Spilman client store dir: {error}"))?;
-        }
         let content = serde_json::to_string_pretty(&self.state)
             .map_err(|error| format!("failed to encode Spilman client store: {error}"))?;
-        fs::write(&self.path, content)
-            .map_err(|error| format!("failed to write Spilman client store: {error}"))?;
-        secure_owner_only(&self.path).map_err(|error| {
-            format!("failed to secure Spilman client store permissions: {error}")
-        })?;
-        Ok(())
+        write_atomic_private(&self.path, content.as_bytes())
+            .map_err(|error| format!("failed to write Spilman client store: {error}"))
     }
 }
 
@@ -204,31 +199,37 @@ pub fn load_or_create_cashu_spilman_sender_key(
     data_dir: &Path,
 ) -> Result<CashuSpilmanSenderKeyFile, String> {
     let path = spilman_sender_key_path(data_dir);
-    match fs::read_to_string(&path) {
-        Ok(content) => {
-            let key: CashuSpilmanSenderKeyFile = serde_json::from_str(&content)
-                .map_err(|error| format!("failed to decode Spilman sender key: {error}"))?;
-            if key.version != SPILMAN_SENDER_KEY_VERSION {
-                return Err(format!(
-                    "unsupported Spilman sender key version {}",
-                    key.version
-                ));
+    loop {
+        match read_private_regular_to_string(&path) {
+            Ok(content) => return decode_cashu_spilman_sender_key(&content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let key = generate_cashu_spilman_sender_key()?;
+                if write_cashu_spilman_sender_key(&path, &key)? {
+                    return Ok(key);
+                }
             }
-            let mut host =
-                cdk_spilman::ConfigurableClientHost::new(cdk_spilman::MemoryClientStorage::new());
-            let public_key_hex = host.add_key_from_hex(&key.secret_hex)?;
-            if public_key_hex != key.public_key_hex {
-                return Err("Spilman sender key public key does not match secret".to_string());
-            }
-            Ok(key)
+            Err(error) => return Err(format!("failed to read Spilman sender key: {error}")),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = generate_cashu_spilman_sender_key()?;
-            write_cashu_spilman_sender_key(&path, &key)?;
-            Ok(key)
-        }
-        Err(error) => Err(format!("failed to read Spilman sender key: {error}")),
     }
+}
+
+#[cfg(feature = "spilman-wallet")]
+fn decode_cashu_spilman_sender_key(content: &str) -> Result<CashuSpilmanSenderKeyFile, String> {
+    let key: CashuSpilmanSenderKeyFile = serde_json::from_str(content)
+        .map_err(|error| format!("failed to decode Spilman sender key: {error}"))?;
+    if key.version != SPILMAN_SENDER_KEY_VERSION {
+        return Err(format!(
+            "unsupported Spilman sender key version {}",
+            key.version
+        ));
+    }
+    let mut host =
+        cdk_spilman::ConfigurableClientHost::new(cdk_spilman::MemoryClientStorage::new());
+    let public_key_hex = host.add_key_from_hex(&key.secret_hex)?;
+    if public_key_hex != key.public_key_hex {
+        return Err("Spilman sender key public key does not match secret".to_string());
+    }
+    Ok(key)
 }
 
 #[cfg(feature = "spilman-wallet")]
@@ -328,18 +329,11 @@ fn generate_cashu_spilman_sender_key() -> Result<CashuSpilmanSenderKeyFile, Stri
 fn write_cashu_spilman_sender_key(
     path: &Path,
     key: &CashuSpilmanSenderKeyFile,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create Spilman sender key dir: {error}"))?;
-    }
+) -> Result<bool, String> {
     let content = serde_json::to_string_pretty(key)
         .map_err(|error| format!("failed to encode Spilman sender key: {error}"))?;
-    fs::write(path, content)
-        .map_err(|error| format!("failed to write Spilman sender key: {error}"))?;
-    secure_owner_only(path)
-        .map_err(|error| format!("failed to secure Spilman sender key permissions: {error}"))?;
-    Ok(())
+    create_atomic_private(path, content.as_bytes())
+        .map_err(|error| format!("failed to write Spilman sender key: {error}"))
 }
 
 #[cfg(feature = "spilman-wallet")]
@@ -693,18 +687,6 @@ fn default_streaming_route_cashu_unit() -> String {
     StreamingRouteCashuUnit::Sat.as_str().to_string()
 }
 
-#[cfg(unix)]
-fn secure_owner_only(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn secure_owner_only(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +735,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_spilman_client_storage_rejects_symlink_reads_and_writes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("client.json");
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, &path).unwrap();
+        assert!(FileSpilmanClientStorage::load(&path).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+        std::fs::remove_file(&path).unwrap();
+        let (mut storage, errors) = FileSpilmanClientStorage::load(&path).unwrap();
+        storage.save_funding("channel-1", test_funding());
+        errors.ensure_ok().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&victim, &path).unwrap();
+        storage.set_closed("channel-1");
+        assert!(errors.ensure_ok().is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    }
+
     #[cfg(feature = "spilman-wallet")]
     #[test]
     fn spilman_sender_key_is_created_and_reused() {
@@ -763,6 +769,20 @@ mod tests {
         assert_eq!(first.version, SPILMAN_SENDER_KEY_VERSION);
         assert_eq!(first.secret_hex.len(), 64);
         assert!(!first.public_key_hex.is_empty());
+    }
+
+    #[cfg(all(feature = "spilman-wallet", unix))]
+    #[test]
+    fn spilman_sender_key_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, spilman_sender_key_path(temp.path())).unwrap();
+
+        assert!(load_or_create_cashu_spilman_sender_key(temp.path()).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
     }
 
     #[cfg(feature = "spilman-wallet")]

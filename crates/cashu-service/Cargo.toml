@@ -1,6 +1,6 @@
 [package]
 name = "cashu-service"
-version = "0.4.2"
+version = "0.4.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -31,7 +31,7 @@ simulation = [
   "cdk-sqlite/mint",
   "tokio/net",
 ]
-spilman = ["dep:cdk-spilman"]
+spilman = ["dep:cdk-spilman", "dep:libc", "dep:tempfile"]
 spilman-wallet = ["spilman", "cdk-spilman/wallet", "dep:rand", "dep:hex"]
 spilman-wallet-http = ["spilman-wallet", "dep:cashu", "dep:reqwest"]
 spilman-configurable-host = [
@@ -65,10 +65,12 @@ cdk-sqlite = { workspace = true, features = ["wallet"], optional = true }
 futures = { version = "0.3", optional = true }
 hex = { workspace = true, optional = true }
 fs2 = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 rand = { version = "0.8", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 rusqlite = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 uuid = { workspace = true, optional = true }
 

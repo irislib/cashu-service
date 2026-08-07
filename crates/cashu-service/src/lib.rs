@@ -28,6 +28,9 @@ pub mod spilman;
 pub use spilman::*;
 
 #[cfg(feature = "spilman")]
+mod private_file;
+
+#[cfg(feature = "spilman")]
 pub mod spilman_client;
 #[cfg(feature = "spilman")]
 pub use spilman_client::*;

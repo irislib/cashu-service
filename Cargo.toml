@@ -30,6 +30,7 @@ tempfile = "3"
 thiserror = "1.0"
 tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
 uuid = { version = "1.0", features = ["v4"] }
+libc = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

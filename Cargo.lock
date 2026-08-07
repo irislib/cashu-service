@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "cashu-service"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -441,6 +441,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "rand 0.8.6",
  "reqwest",
  "rusqlite",

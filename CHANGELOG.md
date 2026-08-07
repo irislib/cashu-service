@@ -1,5 +1,9 @@
 # Changelog
 
+## cashu-service 0.4.3 - 2026-08-07
+
+- Reject symlink and non-file Spilman state, and replace private state atomically without losing its non-root owner.
+
 ## cashu-service 0.4.2 - 2026-07-20
 
 - Restore deterministic Spilman sender refunds from the settlement keyset and import them into the file-backed wallet after mint key rotation.
