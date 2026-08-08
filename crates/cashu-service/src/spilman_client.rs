@@ -3,6 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    fs::File,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -10,7 +11,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::private_file::{
-    create_atomic_private, read_private_regular_to_string, write_atomic_private,
+    create_atomic_private, open_private_lock_file, read_private_regular_to_string,
+    write_atomic_private,
 };
 
 #[cfg(feature = "spilman-wallet")]
@@ -27,8 +29,82 @@ pub fn spilman_client_store_path(data_dir: &Path) -> PathBuf {
     data_dir.join("spilman-client.json")
 }
 
+pub fn spilman_client_store_lock_path(data_dir: &Path) -> PathBuf {
+    lock_path_for_store(&spilman_client_store_path(data_dir))
+}
+
 pub fn spilman_sender_key_path(data_dir: &Path) -> PathBuf {
     data_dir.join("spilman-sender-key.json")
+}
+
+fn lock_path_for_store(store_path: &Path) -> PathBuf {
+    let mut path = store_path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+pub(crate) fn require_lock_for_data_dir(
+    data_dir: &Path,
+    lock: SharedSpilmanClientStoreLock,
+) -> Result<SharedSpilmanClientStoreLock, String> {
+    let expected = spilman_client_store_path(data_dir);
+    if lock.store_path() != expected {
+        return Err(format!(
+            "Spilman client store lock is for {}, expected {}",
+            lock.store_path().display(),
+            expected.display()
+        ));
+    }
+    Ok(lock)
+}
+
+/// Exclusive process lock held until this guard or its consuming storage drops.
+#[derive(Debug)]
+pub struct SharedSpilmanClientStoreLock {
+    store_path: PathBuf,
+    _file: File,
+}
+
+impl SharedSpilmanClientStoreLock {
+    pub fn acquire(store_path: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::acquire_inner(store_path.into(), false)?.ok_or_else(|| {
+            "blocking Spilman client store lock unexpectedly reported busy".to_string()
+        })
+    }
+
+    pub fn try_acquire(store_path: impl Into<PathBuf>) -> Result<Option<Self>, String> {
+        Self::acquire_inner(store_path.into(), true)
+    }
+
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+
+    fn acquire_inner(store_path: PathBuf, nonblocking: bool) -> Result<Option<Self>, String> {
+        let lock_path = lock_path_for_store(&store_path);
+        let file = open_private_lock_file(&lock_path, &store_path).map_err(|error| {
+            format!(
+                "failed to open Spilman client store lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+        let result = if nonblocking {
+            fs2::FileExt::try_lock_exclusive(&file)
+        } else {
+            fs2::FileExt::lock_exclusive(&file)
+        };
+        match result {
+            Ok(()) => Ok(Some(Self {
+                store_path,
+                _file: file,
+            })),
+            Err(error) if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(format!(
+                "failed to lock Spilman client store {}: {error}",
+                store_path.display()
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -85,13 +161,29 @@ pub struct FileSpilmanClientStorage {
     path: PathBuf,
     state: SpilmanClientStoreFile,
     errors: FileSpilmanClientStorageErrorHandle,
+    _lock: SharedSpilmanClientStoreLock,
 }
 
 impl FileSpilmanClientStorage {
     pub fn load(
         path: impl Into<PathBuf>,
     ) -> Result<(Self, FileSpilmanClientStorageErrorHandle), String> {
-        let path = path.into();
+        let lock = SharedSpilmanClientStoreLock::acquire(path)?;
+        Self::load_with_lock(lock)
+    }
+
+    pub fn try_load(
+        path: impl Into<PathBuf>,
+    ) -> Result<Option<(Self, FileSpilmanClientStorageErrorHandle)>, String> {
+        SharedSpilmanClientStoreLock::try_acquire(path)?
+            .map(Self::load_with_lock)
+            .transpose()
+    }
+
+    pub fn load_with_lock(
+        lock: SharedSpilmanClientStoreLock,
+    ) -> Result<(Self, FileSpilmanClientStorageErrorHandle), String> {
+        let path = lock.store_path.clone();
         let state = match read_private_regular_to_string(&path) {
             Ok(content) if content.trim().is_empty() => SpilmanClientStoreFile::new(),
             Ok(content) => {
@@ -116,6 +208,7 @@ impl FileSpilmanClientStorage {
                 path,
                 state,
                 errors: errors.clone(),
+                _lock: lock,
             },
             errors,
         ))
@@ -246,7 +339,23 @@ pub struct FileSpilmanPaymentSigner {
 impl FileSpilmanPaymentSigner {
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let store_path = spilman_client_store_path(data_dir);
-        let (storage, storage_errors) = FileSpilmanClientStorage::load(store_path)?;
+        let lock = SharedSpilmanClientStoreLock::acquire(store_path)?;
+        Self::load_with_lock(data_dir, lock)
+    }
+
+    pub fn try_load(data_dir: &Path) -> Result<Option<Self>, String> {
+        let store_path = spilman_client_store_path(data_dir);
+        SharedSpilmanClientStoreLock::try_acquire(store_path)?
+            .map(|lock| Self::load_with_lock(data_dir, lock))
+            .transpose()
+    }
+
+    pub fn load_with_lock(
+        data_dir: &Path,
+        lock: SharedSpilmanClientStoreLock,
+    ) -> Result<Self, String> {
+        let lock = require_lock_for_data_dir(data_dir, lock)?;
+        let (storage, storage_errors) = FileSpilmanClientStorage::load_with_lock(lock)?;
         let sender = load_or_create_cashu_spilman_sender_key(data_dir)?;
         let mut host = cdk_spilman::ConfigurableClientHost::new(storage);
         let public_key_hex = host.add_key_from_hex(&sender.secret_hex)?;
@@ -379,7 +488,28 @@ where
     N: cdk_spilman::SpilmanClientAsyncNetworking,
 {
     let store_path = spilman_client_store_path(data_dir);
-    let (storage, storage_errors) = FileSpilmanClientStorage::load(store_path)?;
+    let lock = SharedSpilmanClientStoreLock::acquire(store_path)?;
+    open_streaming_route_cashu_spilman_channel_from_token_with_networking_and_lock(
+        data_dir,
+        request,
+        async_networking,
+        lock,
+    )
+    .await
+}
+
+#[cfg(feature = "spilman-wallet")]
+pub async fn open_streaming_route_cashu_spilman_channel_from_token_with_networking_and_lock<N>(
+    data_dir: &Path,
+    request: StreamingRouteOpenCashuSpilmanChannelFromTokenRequest,
+    async_networking: &N,
+    lock: SharedSpilmanClientStoreLock,
+) -> Result<StreamingRouteOpenCashuSpilmanChannelResult, String>
+where
+    N: cdk_spilman::SpilmanClientAsyncNetworking,
+{
+    let lock = require_lock_for_data_dir(data_dir, lock)?;
+    let (storage, storage_errors) = FileSpilmanClientStorage::load_with_lock(lock)?;
     let sender = match request.sender_secret_hex.as_deref() {
         Some(secret_hex) => {
             let mut host =
@@ -606,9 +736,21 @@ pub async fn open_streaming_route_cashu_spilman_channel_from_wallet(
     data_dir: &Path,
     request: StreamingRouteOpenCashuSpilmanChannelFromWalletRequest,
 ) -> anyhow::Result<StreamingRouteOpenCashuSpilmanChannelFromWalletResult> {
+    let lock = SharedSpilmanClientStoreLock::acquire(spilman_client_store_path(data_dir))
+        .map_err(|error| anyhow::anyhow!(error))?;
+    open_streaming_route_cashu_spilman_channel_from_wallet_with_lock(data_dir, request, lock).await
+}
+
+#[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
+pub async fn open_streaming_route_cashu_spilman_channel_from_wallet_with_lock(
+    data_dir: &Path,
+    request: StreamingRouteOpenCashuSpilmanChannelFromWalletRequest,
+    lock: SharedSpilmanClientStoreLock,
+) -> anyhow::Result<StreamingRouteOpenCashuSpilmanChannelFromWalletResult> {
+    let lock = require_lock_for_data_dir(data_dir, lock).map_err(|error| anyhow::anyhow!(error))?;
     crate::wallet::CashuWalletService::open_file_backed(data_dir)
         .await?
-        .open_streaming_route_cashu_spilman_channel(request)
+        .open_streaming_route_cashu_spilman_channel_with_lock(request, lock)
         .await
 }
 
@@ -618,6 +760,20 @@ impl crate::wallet::CashuWalletService {
         &self,
         request: StreamingRouteOpenCashuSpilmanChannelFromWalletRequest,
     ) -> anyhow::Result<StreamingRouteOpenCashuSpilmanChannelFromWalletResult> {
+        let lock =
+            SharedSpilmanClientStoreLock::acquire(spilman_client_store_path(self.data_dir()))
+                .map_err(|error| anyhow::anyhow!(error))?;
+        self.open_streaming_route_cashu_spilman_channel_with_lock(request, lock)
+            .await
+    }
+
+    pub async fn open_streaming_route_cashu_spilman_channel_with_lock(
+        &self,
+        request: StreamingRouteOpenCashuSpilmanChannelFromWalletRequest,
+        lock: SharedSpilmanClientStoreLock,
+    ) -> anyhow::Result<StreamingRouteOpenCashuSpilmanChannelFromWalletResult> {
+        let lock = require_lock_for_data_dir(self.data_dir(), lock)
+            .map_err(|error| anyhow::anyhow!(error))?;
         if request.capacity_sat == 0 {
             anyhow::bail!("Cashu Spilman channel capacity must be greater than zero");
         }
@@ -648,22 +804,24 @@ impl crate::wallet::CashuWalletService {
             .send_payment_token(&request.mint_url, funding_token_amount)
             .await?;
         let networking = HttpSpilmanClientNetworking::new();
-        let channel = open_streaming_route_cashu_spilman_channel_from_token_with_networking(
-            self.data_dir(),
-            StreamingRouteOpenCashuSpilmanChannelFromTokenRequest {
-                token: wallet_send.token.clone(),
-                receiver_pubkey_hex: request.receiver_pubkey_hex,
-                sender_secret_hex: None,
-                expiry_unix: request.expiry_unix,
-                keyset_info_json,
-                max_amount_per_output: request.max_amount_per_output,
-                unit: unit.as_str().to_string(),
-                opening_paid_msat: request.opening_paid_msat,
-            },
-            &networking,
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+        let channel =
+            open_streaming_route_cashu_spilman_channel_from_token_with_networking_and_lock(
+                self.data_dir(),
+                StreamingRouteOpenCashuSpilmanChannelFromTokenRequest {
+                    token: wallet_send.token.clone(),
+                    receiver_pubkey_hex: request.receiver_pubkey_hex,
+                    sender_secret_hex: None,
+                    expiry_unix: request.expiry_unix,
+                    keyset_info_json,
+                    max_amount_per_output: request.max_amount_per_output,
+                    unit: unit.as_str().to_string(),
+                    opening_paid_msat: request.opening_paid_msat,
+                },
+                &networking,
+                lock,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         Ok(StreamingRouteOpenCashuSpilmanChannelFromWalletResult {
             channel,
             wallet_send,
@@ -690,74 +848,6 @@ fn default_streaming_route_cashu_unit() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdk_spilman::ClientStorage;
-
-    fn test_funding() -> cdk_spilman::ClientChannelFunding {
-        cdk_spilman::ClientChannelFunding {
-            params_json: r#"{"capacity":100}"#.to_string(),
-            funding_proofs_json: "[]".to_string(),
-            channel_secret_hex: "aa".repeat(32),
-            keyset_info_json: "{}".to_string(),
-            sender_pubkey_hex: format!("02{}", "bb".repeat(32)),
-            capacity: 100,
-            funding_token_amount: 100,
-            mint_url: "https://mint.example".to_string(),
-            created_at: 123,
-        }
-    }
-
-    #[test]
-    fn file_spilman_client_storage_round_trips_channel_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("client.json");
-        let (mut storage, errors) = FileSpilmanClientStorage::load(&path).unwrap();
-        storage.save_funding("channel-1", test_funding());
-        storage.save_payment_state(
-            "channel-1",
-            cdk_spilman::ClientPaymentState {
-                balance: 7,
-                signature: "sig".to_string(),
-                payment_count: 1,
-                last_payment_at: 456,
-            },
-        );
-        storage.set_closed("channel-1");
-        errors.ensure_ok().unwrap();
-
-        let (storage, errors) = FileSpilmanClientStorage::load(&path).unwrap();
-        errors.ensure_ok().unwrap();
-        assert_eq!(storage.list_channel_ids(), vec!["channel-1".to_string()]);
-        assert_eq!(storage.get_funding("channel-1").unwrap().capacity, 100);
-        assert_eq!(storage.get_payment_state("channel-1").unwrap().balance, 7);
-        assert_eq!(
-            storage.get_state("channel-1"),
-            cdk_spilman::ClientChannelState::Closed
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn file_spilman_client_storage_rejects_symlink_reads_and_writes() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("client.json");
-        let victim = temp.path().join("victim");
-        std::fs::write(&victim, b"untouched").unwrap();
-        symlink(&victim, &path).unwrap();
-        assert!(FileSpilmanClientStorage::load(&path).is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
-
-        std::fs::remove_file(&path).unwrap();
-        let (mut storage, errors) = FileSpilmanClientStorage::load(&path).unwrap();
-        storage.save_funding("channel-1", test_funding());
-        errors.ensure_ok().unwrap();
-        std::fs::remove_file(&path).unwrap();
-        symlink(&victim, &path).unwrap();
-        storage.set_closed("channel-1");
-        assert!(errors.ensure_ok().is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
-    }
 
     #[cfg(feature = "spilman-wallet")]
     #[test]

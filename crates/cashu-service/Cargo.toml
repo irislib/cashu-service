@@ -31,7 +31,7 @@ simulation = [
   "cdk-sqlite/mint",
   "tokio/net",
 ]
-spilman = ["dep:cdk-spilman", "dep:libc", "dep:tempfile"]
+spilman = ["dep:cdk-spilman", "dep:fs2", "dep:libc", "dep:tempfile"]
 spilman-wallet = ["spilman", "cdk-spilman/wallet", "dep:rand", "dep:hex"]
 spilman-wallet-http = ["spilman-wallet", "dep:cashu", "dep:reqwest"]
 spilman-configurable-host = [

@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     fetch_spilman_keyset_info_json, load_or_create_cashu_spilman_sender_key,
-    spilman_client_store_path, FileSpilmanClientStorage,
+    require_lock_for_data_dir, spilman_client_store_path, FileSpilmanClientStorage,
+    SharedSpilmanClientStoreLock,
 };
 
 #[derive(Debug, Clone)]
@@ -85,13 +86,23 @@ pub async fn restore_streaming_route_cashu_spilman_refund(
     data_dir: &Path,
     channel_id: &str,
 ) -> anyhow::Result<StreamingRouteRestoreCashuSpilmanRefundResult> {
+    let lock = SharedSpilmanClientStoreLock::acquire(spilman_client_store_path(data_dir))
+        .map_err(|error| anyhow::anyhow!(error))?;
+    restore_streaming_route_cashu_spilman_refund_with_lock(data_dir, channel_id, lock).await
+}
+
+pub async fn restore_streaming_route_cashu_spilman_refund_with_lock(
+    data_dir: &Path,
+    channel_id: &str,
+    lock: SharedSpilmanClientStoreLock,
+) -> anyhow::Result<StreamingRouteRestoreCashuSpilmanRefundResult> {
     let channel_id = channel_id.trim();
     if channel_id.is_empty() {
         anyhow::bail!("missing Cashu Spilman channel id");
     }
-    let store_path = spilman_client_store_path(data_dir);
-    let (storage, storage_errors) =
-        FileSpilmanClientStorage::load(&store_path).map_err(|error| anyhow::anyhow!(error))?;
+    let lock = require_lock_for_data_dir(data_dir, lock).map_err(|error| anyhow::anyhow!(error))?;
+    let (mut storage, storage_errors) =
+        FileSpilmanClientStorage::load_with_lock(lock).map_err(|error| anyhow::anyhow!(error))?;
     let funding = storage
         .get_funding(channel_id)
         .cloned()
@@ -159,10 +170,7 @@ pub async fn restore_streaming_route_cashu_spilman_refund(
             .await?
             .amount_sat
     };
-    let (mut storage, errors) =
-        FileSpilmanClientStorage::load(store_path).map_err(|error| anyhow::anyhow!(error))?;
     storage.set_closed(channel_id);
-    errors.ensure_ok().map_err(|error| anyhow::anyhow!(error))?;
     storage_errors
         .ensure_ok()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -234,6 +242,7 @@ mod tests {
         storage.save_funding("channel-1", test_funding());
         storage.set_closed("channel-1");
         errors.ensure_ok().unwrap();
+        drop(storage);
 
         let result = restore_streaming_route_cashu_spilman_refund(temp.path(), "channel-1")
             .await
