@@ -8,6 +8,8 @@ use std::{
 };
 
 use cashu_service::FileSpilmanClientStorage;
+#[cfg(feature = "spilman-wallet")]
+use cashu_service::FileSpilmanPaymentSigner;
 use cdk_spilman::ClientStorage;
 
 const PROCESS_TEST_ROLE: &str = "CASHU_SPILMAN_STORAGE_PROCESS_TEST_ROLE";
@@ -45,6 +47,15 @@ fn file_spilman_client_storage_process_child() {
     };
     let directory = PathBuf::from(std::env::var_os(PROCESS_TEST_DIR).unwrap());
     let path = directory.join("client.json");
+    #[cfg(feature = "spilman-wallet")]
+    if role == "fifo-signer-try-load" {
+        match FileSpilmanPaymentSigner::try_load(&directory) {
+            Err(_) => {}
+            Ok(None) => panic!("Spilman signer store lock unexpectedly reported busy"),
+            Ok(Some(_)) => panic!("Spilman signer accepted FIFO state"),
+        }
+        return;
+    }
     if role == "second" {
         std::fs::write(directory.join("second-started"), b"").unwrap();
     }
@@ -119,6 +130,45 @@ fn file_spilman_client_storage_try_load_reports_busy() {
     assert!(FileSpilmanClientStorage::try_load(&path).unwrap().is_none());
     drop(storage);
     assert!(FileSpilmanClientStorage::try_load(&path).unwrap().is_some());
+}
+
+#[cfg(all(unix, feature = "spilman-wallet"))]
+#[test]
+fn file_spilman_payment_signer_try_load_rejects_fifo_promptly() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = cashu_service::spilman_client_store_path(directory.path());
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is a valid NUL-terminated platform path and mode is valid.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let executable = std::env::current_exe().unwrap();
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            "file_spilman_client_storage_process_child",
+            "--nocapture",
+        ])
+        .env(PROCESS_TEST_ROLE, "fifo-signer-try-load")
+        .env(PROCESS_TEST_DIR, directory.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "FIFO rejection child failed");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("Spilman client storage blocked while opening a FIFO");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

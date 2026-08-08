@@ -69,7 +69,9 @@ fn open_regular_nofollow_with_access(path: &Path, writable: bool) -> io::Result<
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        // Validate the opened descriptor before using it without letting a
+        // FIFO or device block the process during `open`.
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {

@@ -1,5 +1,9 @@
 # Changelog
 
+## cashu-service 0.4.4 - 2026-08-08
+
+- Reject Unix FIFO and device Spilman state without blocking the process during validation.
+
 ## cashu-service 0.4.3 - 2026-08-07
 
 - Reject symlink and non-file Spilman state, and replace private state atomically without losing its non-root owner.
