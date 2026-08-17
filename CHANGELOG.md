@@ -1,5 +1,9 @@
 # Changelog
 
+## cashu-service 0.4.6 - 2026-08-17
+
+- Require `cdk-spilman` 0.17.5 or newer, matching the sender-refund API used by the service.
+
 ## cashu-service 0.4.5 - 2026-08-17
 
 - Consolidate wallet proofs into the selected active keyset before opening a Spilman channel, preventing mixed-keyset funding failures after mint key rotation.

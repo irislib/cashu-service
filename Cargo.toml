@@ -16,7 +16,7 @@ authors = ["Martti Malmi"]
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
-cdk-spilman = { version = "0.17.0", default-features = false }
+cdk-spilman = { version = "0.17.5", default-features = false }
 cdk = { version = "=0.17.3", package = "cdk", default-features = false }
 cashu = { version = "=0.17.3", package = "cashu", default-features = false }
 cdk-common = { version = "=0.17.3", package = "cdk-common", default-features = false }
