@@ -1,5 +1,9 @@
 # Changelog
 
+## cashu-service 0.4.5 - 2026-08-17
+
+- Consolidate wallet proofs into the selected active keyset before opening a Spilman channel, preventing mixed-keyset funding failures after mint key rotation.
+
 ## cashu-service 0.4.4 - 2026-08-08
 
 - Reject Unix FIFO and device Spilman state without blocking the process during validation.

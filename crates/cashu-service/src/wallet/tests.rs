@@ -250,6 +250,21 @@ fn binary_proof_infos(mint_url: MintUrl, keyset_id: Id, amount_sat: u64) -> Vec<
 }
 
 #[test]
+fn proofs_require_consolidation_when_any_keyset_differs() {
+    let expected = build_test_keyset(64).id;
+    let other = build_test_keyset(128).id;
+
+    assert!(!proofs_require_keyset_consolidation(
+        &[make_test_proof(expected, 1), make_test_proof(expected, 2)],
+        expected,
+    ));
+    assert!(proofs_require_keyset_consolidation(
+        &[make_test_proof(expected, 1), make_test_proof(other, 2)],
+        expected,
+    ));
+}
+
+#[test]
 fn test_normalize_mint_url_trims_trailing_slash_and_rejects_query() {
     assert_eq!(
         normalize_mint_url("https://mint.example/").unwrap(),

@@ -645,27 +645,12 @@ pub async fn fetch_spilman_keyset_info_json(
         .and_then(|value| value.as_array())
         .ok_or("Cashu mint keysets response is missing keysets")?;
     let unit = unit.trim().to_ascii_lowercase();
-    let selected = keysets
-        .iter()
-        .find(|entry| {
-            let entry_id = entry.get("id").and_then(|value| value.as_str());
-            let entry_unit = entry
-                .get("unit")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_ascii_lowercase());
-            let active = entry
-                .get("active")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            entry_unit.as_deref() == Some(unit.as_str())
-                && keyset_id.map_or(active, |expected| entry_id == Some(expected))
-        })
-        .ok_or_else(|| {
-            keyset_id.map_or_else(
-                || format!("Cashu mint has no active {unit} keyset"),
-                |id| format!("Cashu mint has no {unit} keyset {id}"),
-            )
-        })?;
+    let selected = select_spilman_keyset(keysets, &unit, keyset_id).ok_or_else(|| {
+        keyset_id.map_or_else(
+            || format!("Cashu mint has no active {unit} keyset"),
+            |id| format!("Cashu mint has no {unit} keyset {id}"),
+        )
+    })?;
     let selected_id = selected
         .get("id")
         .and_then(|value| value.as_str())
@@ -703,6 +688,35 @@ pub async fn fetch_spilman_keyset_info_json(
         keyset_info["finalExpiry"] = serde_json::json!(final_expiry);
     }
     Ok(keyset_info.to_string())
+}
+
+#[cfg(feature = "spilman-wallet-http")]
+fn select_spilman_keyset<'a>(
+    keysets: &'a [serde_json::Value],
+    unit: &str,
+    keyset_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    keysets
+        .iter()
+        .filter(|entry| {
+            let entry_id = entry.get("id").and_then(|value| value.as_str());
+            let entry_unit = entry
+                .get("unit")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_ascii_lowercase());
+            let active = entry
+                .get("active")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            entry_unit.as_deref() == Some(unit)
+                && keyset_id.map_or(active, |expected| entry_id == Some(expected))
+        })
+        .min_by_key(|entry| {
+            entry
+                .get("input_fee_ppk")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default()
+        })
 }
 
 #[cfg(all(feature = "wallet", feature = "spilman-wallet-http"))]
@@ -800,8 +814,15 @@ impl crate::wallet::CashuWalletService {
             request.max_amount_per_output,
         )
         .map_err(|error| anyhow::anyhow!(error))?;
+        let funding_keyset_id = cdk_spilman::parse_keyset_info_from_json(&keyset_info_json)
+            .map_err(|error| anyhow::anyhow!(error))?
+            .keyset_id;
         let wallet_send = self
-            .send_payment_token(&request.mint_url, funding_token_amount)
+            .send_payment_token_for_keyset(
+                &request.mint_url,
+                funding_token_amount,
+                funding_keyset_id,
+            )
             .await?;
         let networking = HttpSpilmanClientNetworking::new();
         let channel =
@@ -848,6 +869,32 @@ fn default_streaming_route_cashu_unit() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "spilman-wallet-http")]
+    #[test]
+    fn automatic_spilman_keyset_selection_matches_wallet_fee_policy() {
+        let keysets = serde_json::json!([
+            {"id": "expensive", "unit": "sat", "active": true, "input_fee_ppk": 200},
+            {"id": "inactive", "unit": "sat", "active": false, "input_fee_ppk": 0},
+            {"id": "cheap", "unit": "sat", "active": true, "input_fee_ppk": 100}
+        ]);
+        let keysets = keysets.as_array().unwrap();
+
+        assert_eq!(
+            select_spilman_keyset(keysets, "sat", None)
+                .unwrap()
+                .get("id")
+                .unwrap(),
+            "cheap"
+        );
+        assert_eq!(
+            select_spilman_keyset(keysets, "sat", Some("inactive"))
+                .unwrap()
+                .get("id")
+                .unwrap(),
+            "inactive"
+        );
+    }
 
     #[cfg(feature = "spilman-wallet")]
     #[test]
