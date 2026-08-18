@@ -67,8 +67,12 @@ impl CashuWalletService {
             .context("Failed to recover Cashu wallet state before sending payment")?;
 
         if let Some(required_keyset_id) = required_keyset_id {
+            // The Spilman keyset was fetched directly from the mint immediately
+            // before this call. Refresh the wallet metadata too: a cached active
+            // keyset can legitimately predate a mint rotation and must not block
+            // consolidation of old proofs into the selected current keyset.
             let active_keyset_id = wallet
-                .get_active_keyset()
+                .fetch_active_keyset()
                 .await
                 .context("Failed to load the active Cashu keyset")?
                 .id;

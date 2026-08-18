@@ -1,5 +1,9 @@
 # Changelog
 
+## cashu-service 0.4.7 - 2026-08-18
+
+- Refresh wallet keyset metadata before opening a Spilman channel so mint key rotation can consolidate old proofs into the current keyset instead of failing on stale cached metadata.
+
 ## cashu-service 0.4.6 - 2026-08-17
 
 - Require `cdk-spilman` 0.17.5 or newer, matching the sender-refund API used by the service.
